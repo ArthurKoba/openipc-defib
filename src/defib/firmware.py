@@ -61,7 +61,11 @@ CV6XX_BOOT_VARIANTS: dict[str, tuple[str, ...]] = {
 # needs a different published U-Boot because its DDR cold-init data or memory
 # geometry is incompatible with the generic image. Device selectors map to the
 # matching hardware artifact while the generic per-chip image remains unchanged.
-CLASSIC_UBOOT_VARIANTS: dict[str, dict[str, str]] = {}
+CLASSIC_UBOOT_VARIANTS: dict[str, dict[str, str]] = {
+    "hi3518ev100": {
+        "hiwatch-ds-i203": "u-boot-hi3518ev100-ddr3-256m-universal.bin",
+    },
+}
 
 # Chip aliases: map chip names to the firmware download name
 # e.g. hi3516ev300 profile resolves to hi3516ev200 internally,

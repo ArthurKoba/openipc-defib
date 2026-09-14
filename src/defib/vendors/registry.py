@@ -32,7 +32,20 @@ _BOOTSTRAPS: dict[str, BootstrapFactory] = {
     "hikvision": HikvisionUBootBootstrap,
 }
 
-_STOCK_UBOOT_TARGETS: dict[str, StockUBootTarget] = {}
+_STOCK_UBOOT_TARGETS: dict[str, StockUBootTarget] = {
+    "hi3518ev100:hiwatch-ds-i203": StockUBootTarget(
+        selector="hi3518ev100:hiwatch-ds-i203",
+        handler="hikvision",
+        load_address=0x81000000,
+        display_name="HiWatch DS-I203",
+        vendor="Hikvision",
+        stock_uboot_name="Hikvision U-Boot 2010.06",
+        # Needed only by the chainloaded OpenIPC U-Boot while Defib performs
+        # TFTP. The published DDR variant deliberately keeps generic U-Boot
+        # environment defaults; the device profile owns persistent PHY policy.
+        transient_env=(("phyaddru", "3"),),
+    ),
+}
 
 
 def get_stock_uboot_target(selector: str) -> StockUBootTarget | None:

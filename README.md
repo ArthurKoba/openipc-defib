@@ -65,15 +65,39 @@ defib install -c hi3516ev300 \
 
 The install command orchestrates the entire process:
 1. Extracts and verifies the firmware tarball (MD5 checksums)
-2. Downloads U-Boot from OpenIPC (or uses cached copy)
-3. Burns U-Boot to RAM via boot ROM protocol
-4. Breaks into U-Boot console
+2. Resolves U-Boot from OpenIPC releases (or uses cached/local copy)
+3. Reaches an OpenIPC U-Boot shell through boot ROM or a registered stock-U-Boot bootstrap
+4. Detects the flash and selects the standard OpenIPC layout
 5. Starts a multi-file TFTP server and configures U-Boot networking
 6. Flashes each partition (U-Boot, kernel, rootfs) with CRC32 verification
 7. Saves the boot environment and resets
 
-Requires root for TFTP port 69 and NIC IP assignment. Supports both 8MB and
-16MB NOR flash layouts (`--nor-size 8` or `--nor-size 16`).
+Requires root for TFTP port 69 and NIC IP assignment. Standard 8/16/32 MiB
+NOR layouts are selected from U-Boot flash detection; `--nor-size` remains an
+explicit override.
+
+Targets that must bootstrap through a stock U-Boot use an explicit U-Boot
+variant. For example, HiWatch DS-I203 uses:
+
+```bash
+defib install -c hi3518ev100:hiwatch-ds-i203 \
+  --firmware hi3518ev100_lite_hiwatch-ds-i203-nor.tgz -p /dev/ttyUSB0
+```
+
+For such selectors, Defib resolves the published U-Boot variant through the
+normal OpenIPC release/cache mechanism. Hikvision Ctrl+U / `HKVS #` / YMODEM
+handling lives in `defib.vendors.hikvision`. The registry also carries any
+installer-only runtime environment required to complete the migration (for the
+DS-I203, `phyaddru=3` so the chainloaded U-Boot can use TFTP). These values are
+transient and disappear when Defib erases the old persistent environment before rebooting the freshly flashed U-Boot.
+
+The release U-Boot owns boot-critical hardware initialization such as DDR
+cold-init and RAM probing limits. Defib owns the layout it actually flashes: it
+detects NOR capacity, selects the standard OpenIPC 8/16/32 MiB layout, and
+persists the matching `mtdparts` before the first Linux boot. Device runtime
+policy such as `osmem`, Linux PHY parameters and sensor selection belongs to the
+firmware/device profile. An explicit local U-Boot can still be supplied with
+`--uboot`.
 
 ## Flash Dump Restore
 
@@ -118,7 +142,7 @@ Handles both `tftpboot` and `tftp` U-Boot commands transparently.
 - All 3 HiSilicon/Goke UART protocols (Standard, V500, CV6xx)
 - 120+ supported SoC chips
 - Full firmware install via UART + TFTP with CRC32 verification
-- Reusable stock U-Boot bootstrap implementations plus board-specific install profiles
+- Reusable stock U-Boot bootstrap implementations plus release U-Boot variants
 - Multiple interfaces: CLI, TUI, Web UI, JSON for automation
 - Multi-file TFTP server with filename-based routing
 - UART session capture/replay (.dcap format)

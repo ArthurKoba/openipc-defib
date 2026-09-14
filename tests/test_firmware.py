@@ -6,13 +6,14 @@ import pytest
 
 from defib.firmware import (
     AVAILABLE_FIRMWARE,
+    CLASSIC_UBOOT_VARIANTS,
     CV6XX_BOOT_VARIANTS,
     asset_name,
     download_firmware,
     firmware_url,
-    has_firmware,
     get_cache_dir,
     get_cached_path,
+    has_firmware,
     pad_to_size,
 )
 
@@ -192,3 +193,33 @@ class TestClassicChipsUnchanged:
         # Shipped u-boot-*-universal.bin assets that the set used to omit.
         for chip in ["hi3520dv200", "hi3536cv100", "hi3536dv100"]:
             assert has_firmware(chip)
+
+
+class TestClassicBoardVariants:
+    def test_ds_i203_resolves_to_dedicated_release_asset(self):
+        selector = "hi3518ev100:hiwatch-ds-i203"
+        assert asset_name(selector) == "u-boot-hi3518ev100-ddr3-256m-universal.bin"
+        assert firmware_url(selector) == (
+            "https://github.com/OpenIPC/firmware/releases/download/latest/"
+            "u-boot-hi3518ev100-ddr3-256m-universal.bin"
+        )
+
+    def test_generic_hi3518ev100_stays_universal(self):
+        assert asset_name("hi3518ev100") == "u-boot-hi3518ev100-universal.bin"
+
+    def test_unknown_registered_classic_variant_is_rejected(self):
+        assert "hi3518ev100" in CLASSIC_UBOOT_VARIANTS
+        assert asset_name("hi3518ev100:not-a-board") is None
+
+    def test_board_variant_never_falls_back_to_universal_cache(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+        monkeypatch.setattr("sys.platform", "linux")
+        cache = get_cache_dir()
+        (cache / "u-boot-hi3518ev100-universal.bin").write_bytes(b"U" * 4096)
+        assert get_cached_path("hi3518ev100:hiwatch-ds-i203") is None
+
+        dedicated = cache / "u-boot-hi3518ev100-ddr3-256m-universal.bin"
+        dedicated.write_bytes(b"D" * 182580)
+        assert get_cached_path("hi3518ev100:hiwatch-ds-i203") == dedicated

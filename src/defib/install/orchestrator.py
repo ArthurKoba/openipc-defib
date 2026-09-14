@@ -21,6 +21,7 @@ from defib.install.layout import (
     nand_bootargs,
     nor_layout,
     nor_mtdparts,
+    parse_uboot_crc32,
     set_uboot_env_verified,
     uboot_flash_command_error,
 )
@@ -93,6 +94,14 @@ async def run_install(request: InstallRequest) -> None:
                 "that yet — use `defib burn` to bring the board up.[/red]"
             )
             raise typer.Exit(1)
+
+    if has_stock_uboot and not nand and not wipe_env:
+        console.print(
+            "[red]Stock U-Boot migration requires --wipe-env so the newly "
+            "flashed OpenIPC U-Boot can start from its compiled defaults. "
+            "Defib preserves and restores the captured factory ethaddr.[/red]"
+        )
+        raise typer.Exit(2)
 
     # The NOR boot and env partitions are fixed across the standard OpenIPC
     # 8/16/32 MiB layouts. Kernel/rootfs sizing is selected after ``sf probe``
@@ -172,8 +181,18 @@ async def run_install(request: InstallRequest) -> None:
     # Install writes a fixed boot partition. Release/override payloads may be
     # shorter, so preserve the existing installer contract by padding the tail
     # with erased flash bytes before chainload and flashing.
-    uboot_data = pad_to_size(uboot_raw, b_sz)
-    uboot_flash_size = b_sz + env_sz if wipe_env else b_sz
+    try:
+        uboot_data = pad_to_size(uboot_raw, b_sz)
+    except ValueError as exc:
+        console.print(
+            f"[red]U-Boot artifact does not fit the boot partition:[/red] {exc}"
+        )
+        raise typer.Exit(1) from exc
+
+    # Vendor migrations erase the environment only after all firmware partitions
+    # have been written and verified. Generic installs retain their historical
+    # --wipe-env behavior of erasing boot+env together.
+    uboot_flash_size = b_sz + env_sz if wipe_env and not has_stock_uboot else b_sz
 
     if output == "human":
         if len(uboot_raw) == len(uboot_data):
@@ -206,7 +225,11 @@ async def run_install(request: InstallRequest) -> None:
                     console.print(f"  PoE: [cyan]{poe_port}[/cyan] (explicit)")
             else:
                 port_basename = Path(port).name
-                device_label = port_basename.removeprefix("uart-") if port_basename.startswith("uart-") else port_basename
+                device_label = (
+                    port_basename.removeprefix("uart-")
+                    if port_basename.startswith("uart-")
+                    else port_basename
+                )
                 try:
                     poe_port = await power_controller.find_port_by_comment(device_label)
                 except Exception as e:  # noqa: BLE001 - provider APIs are not exception-uniform
@@ -287,7 +310,8 @@ async def run_install(request: InstallRequest) -> None:
                 console.print("  Power-cycling before stock U-Boot bootstrap...")
             try:
                 await power_controller.power_cycle(poe_port or "")
-            except Exception as exc:  # noqa: BLE001 - present controller/transport failures uniformly
+            except Exception as exc:  # noqa: BLE001
+                # Present controller/transport failures uniformly.
                 console.print(f"[red]Power cycle failed:[/red] {exc}")
                 await transport.close()
                 await power_controller.close()
@@ -729,7 +753,10 @@ async def run_install(request: InstallRequest) -> None:
             ) -> None:
                 """TFTP download, full-partition erase/write, and CRC verify."""
                 if output == "human":
-                    console.print(f"\n  [bold]Flashing {name}[/bold] → 0x{flash_off:X} ({len(orig_data)} bytes)")
+                    console.print(
+                        f"\n  [bold]Flashing {name}[/bold] → 0x{flash_off:X} "
+                        f"({len(orig_data)} bytes)"
+                    )
 
                 try:
                     resp = await _tftp_to_ram(tftp_name, timeout=120.0)
@@ -743,17 +770,21 @@ async def run_install(request: InstallRequest) -> None:
                     f"crc32 0x{ram_addr:x} 0x{len(orig_data):x}",
                     timeout=10.0,
                 )
-                m = re_mod.search(r"==>\s*([0-9a-fA-F]{8})", resp)
-                if m:
-                    ram_crc = int(m.group(1), 16)
-                    if ram_crc != expected_crc:
-                        console.print(
-                            f"[red]{name} CRC mismatch after TFTP![/red] "
-                            f"expected={expected_crc:08X} got={ram_crc:08X}"
-                        )
-                        raise typer.Exit(1)
-                    if output == "human":
-                        console.print(f"    TFTP CRC verified: {ram_crc:08X}")
+                ram_crc = parse_uboot_crc32(resp)
+                if ram_crc is None:
+                    console.print(
+                        f"[red]{name} CRC check after TFTP returned no checksum:[/red] "
+                        f"{resp.strip()[-200:]}"
+                    )
+                    raise typer.Exit(1)
+                if ram_crc != expected_crc:
+                    console.print(
+                        f"[red]{name} CRC mismatch after TFTP![/red] "
+                        f"expected={expected_crc:08X} got={ram_crc:08X}"
+                    )
+                    raise typer.Exit(1)
+                if output == "human":
+                    console.print(f"    TFTP CRC verified: {ram_crc:08X}")
 
                 # OpenIPC NOR layouts define fixed kernel/rootfs partitions.
                 # Erase the whole partition so no stock filesystem tail survives
@@ -818,17 +849,21 @@ async def run_install(request: InstallRequest) -> None:
                         f"crc32 0x{ram_addr:x} 0x{len(orig_data):x}",
                         timeout=10.0,
                     )
-                    m = re_mod.search(r"==>\s*([0-9a-fA-F]{8})", resp)
-                    if m:
-                        flash_crc = int(m.group(1), 16)
-                        if flash_crc != expected_crc:
-                            console.print(
-                                f"[red]{name} flash verify failed![/red] "
-                                f"expected={expected_crc:08X} got={flash_crc:08X}"
-                            )
-                            raise typer.Exit(1)
-                        if output == "human":
-                            console.print(f"    Flash verified: {flash_crc:08X}")
+                    flash_crc = parse_uboot_crc32(resp)
+                    if flash_crc is None:
+                        console.print(
+                            f"[red]{name} flash readback returned no checksum:[/red] "
+                            f"{resp.strip()[-200:]}"
+                        )
+                        raise typer.Exit(1)
+                    if flash_crc != expected_crc:
+                        console.print(
+                            f"[red]{name} flash verify failed![/red] "
+                            f"expected={expected_crc:08X} got={flash_crc:08X}"
+                        )
+                        raise typer.Exit(1)
+                    if output == "human":
+                        console.print(f"    Flash verified: {flash_crc:08X}")
 
                 if output == "human":
                     console.print(f"  [green]{name} OK[/green]")

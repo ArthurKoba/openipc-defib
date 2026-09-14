@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import zlib
 from collections.abc import Awaitable, Callable
 
@@ -147,13 +148,19 @@ def nand_bootargs(rootfs_is_ubi: bool) -> str:
     )
 
 
+def parse_uboot_crc32(response: str) -> int | None:
+    """Return the CRC printed by U-Boot, or ``None`` if it is missing."""
+    match = re.search(r"==>\s*([0-9a-fA-F]{8})", response)
+    return int(match.group(1), 16) if match else None
+
+
 def detect_nor_size_mb(response: str) -> int | None:
     """Parse SPI NOR capacity from common HiSilicon U-Boot ``sf probe`` output."""
-    import re
-
     patterns = (
         (r"\bChip:\s*(\d+)\s*MB\b", 1),
         (r"\bspi\s+size:\s*(\d+)\s*MB\b", 1),
+        (r"\b(?:spi\s+nor\s+)?total\s+size:\s*(\d+)\s*MB\b", 1),
+        (r"\bSF:[^\n]*\btotal\s+(\d+)\s*MB\b", 1),
         (r"\b(\d+)\s+MiB\b[^\n]*(?:hi_sfc|spi)", 1),
         (r"\b(\d+)\s+KiB\b[^\n]*(?:hi_sfc|spi)", 1024),
     )

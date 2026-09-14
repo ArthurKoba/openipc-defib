@@ -2169,10 +2169,12 @@ def install(
     ),
     nand: bool = typer.Option(False, "--nand", help="Use NAND flash instead of NOR"),
     wipe_env: bool = typer.Option(
-        False, "--wipe-env",
-        help="Erase the env partition during U-Boot flash (loses ethaddr; "
-             "default is to preserve env so MACs aren't reset to the OpenIPC "
-             "u-boot default 00:00:23:34:45:66).",
+        False,
+        "--wipe-env",
+        help=(
+            "Erase the persistent U-Boot environment. Required for registered "
+            "stock-U-Boot migrations; their captured factory ethaddr is restored."
+        ),
     ),
     final_reset: bool = typer.Option(
         True,

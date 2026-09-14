@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from types import ModuleType
 
 import pytest
+import typer
 
 from defib.firmware import asset_name
 from defib.install import InstallRequest
@@ -186,6 +187,7 @@ async def test_ds_i203_final_migration_contract_all_uboot_outcomes(
                 port="COM15",
                 host_ip="192.168.1.11",
                 device_ip="192.168.1.64",
+                wipe_env=True,
                 tftp_via="host",
                 output="json",
             )
@@ -282,8 +284,74 @@ async def test_ds_i203_final_migration_contract_all_uboot_outcomes(
 
 
 @pytest.mark.asyncio
+async def test_ds_i203_stock_install_requires_explicit_env_wipe(monkeypatch):
+    from defib.install import orchestrator
+
+    async def unexpected_transport(port: str):
+        raise AssertionError(f"transport opened before --wipe-env preflight: {port}")
+
+    serial_platform = ModuleType("defib.transport.serial_platform")
+    serial_platform.create_transport = unexpected_transport
+    serial_platform.normalize_port_name = lambda port: port
+    monkeypatch.setitem(sys.modules, "defib.transport.serial_platform", serial_platform)
+
+    with pytest.raises(typer.Exit) as exc_info:
+        await orchestrator.run_install(
+            InstallRequest(
+                chip=SELECTOR,
+                firmware_path="unused.tgz",
+                output="json",
+            )
+        )
+
+    assert exc_info.value.exit_code == 2
+
+
+@pytest.mark.asyncio
+async def test_install_rejects_oversized_uboot_override_cleanly(
+    monkeypatch, tmp_path, capsys
+):
+    from defib.install import orchestrator
+
+    async def unexpected_transport(port: str):
+        raise AssertionError(f"transport opened for oversized U-Boot: {port}")
+
+    serial_platform = ModuleType("defib.transport.serial_platform")
+    serial_platform.create_transport = unexpected_transport
+    serial_platform.normalize_port_name = lambda port: port
+    monkeypatch.setitem(sys.modules, "defib.transport.serial_platform", serial_platform)
+
+    firmware_tar = tmp_path / "openipc.hi3516cv100-nor-lite.tgz"
+    with tarfile.open(firmware_tar, "w:gz") as archive:
+        for name, payload in (
+            ("uImage.hi3516cv100", b"kernel"),
+            ("rootfs.squashfs.hi3516cv100", b"rootfs"),
+        ):
+            info = tarfile.TarInfo(name)
+            info.size = len(payload)
+            archive.addfile(info, io.BytesIO(payload))
+
+    oversized = tmp_path / "u-boot-too-large.bin"
+    oversized.write_bytes(b"U" * (0x40000 + 1))
+
+    with pytest.raises(typer.Exit) as exc_info:
+        await orchestrator.run_install(
+            InstallRequest(
+                chip="hi3518ev100",
+                firmware_path=str(firmware_tar),
+                uboot_path=str(oversized),
+                output="human",
+            )
+        )
+
+    assert exc_info.value.exit_code == 1
+    assert "does not fit the boot partition" in capsys.readouterr().out
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("crc_failure", [None, "tftp", "readback"])
 async def test_ds_i203_stock_install_persists_detected_layout_but_not_camera_policy(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, crc_failure
 ):
     """Exercise the complete stock->OpenIPC NOR install contract.
 
@@ -401,6 +469,7 @@ async def test_ds_i203_stock_install_persists_detected_layout_but_not_camera_pol
     flash = bytearray(b"\xa5" * 0x1000000)
     ram = b""
     env_erased = False
+    crc_calls = 0
 
     generic_defaults = {
         "osmem": "32M",
@@ -411,7 +480,7 @@ async def test_ds_i203_stock_install_persists_detected_layout_but_not_camera_pol
     async def fake_send_command(
         uart, command: str, timeout: float = 60.0, **kwargs
     ) -> str:
-        nonlocal ram, env_erased, saved_env, env
+        nonlocal ram, env_erased, saved_env, env, crc_calls
         assert uart is transport
         commands.append(command)
 
@@ -472,6 +541,11 @@ async def test_ds_i203_stock_install_persists_detected_layout_but_not_camera_pol
             return f"==> {crc:08X}\nOpenIPC # "
 
         if command.startswith("crc32 "):
+            crc_calls += 1
+            if crc_failure == "tftp" and crc_calls == 1:
+                return "CRC32 command timed out\nOpenIPC # "
+            if crc_failure == "readback" and crc_calls == 2:
+                return "CRC32 output truncated\nOpenIPC # "
             size = int(command.split()[-1], 16)
             crc = zlib.crc32(ram[:size]) & 0xFFFFFFFF
             return f"==> {crc:08X}\nOpenIPC # "
@@ -509,19 +583,32 @@ async def test_ds_i203_stock_install_persists_detected_layout_but_not_camera_pol
         lambda *args, **kwargs: FakeBootstrap(),
     )
 
-    await orchestrator.run_install(
-        InstallRequest(
-            chip=SELECTOR,
-            firmware_path=str(firmware_tar),
-            uboot_path=str(uboot_override),
-            port="COM15",
-            nic="Ethernet",
-            host_ip="192.168.1.11",
-            device_ip="192.168.1.64",
-            tftp_via="host",
-            output="json",
-        )
+    request = InstallRequest(
+        chip=SELECTOR,
+        firmware_path=str(firmware_tar),
+        uboot_path=str(uboot_override),
+        port="COM15",
+        nic="Ethernet",
+        host_ip="192.168.1.11",
+        device_ip="192.168.1.64",
+        wipe_env=True,
+        tftp_via="host",
+        output="json",
     )
+
+    if crc_failure is None:
+        await orchestrator.run_install(request)
+    else:
+        with pytest.raises(typer.Exit) as exc_info:
+            await orchestrator.run_install(request)
+        assert exc_info.value.exit_code == 1
+        if crc_failure == "tftp":
+            assert not any(cmd.startswith("sf erase ") for cmd in commands)
+            assert not any(cmd.startswith("sf write ") for cmd in commands)
+        else:
+            assert any(cmd.startswith("sf write ") for cmd in commands)
+            assert "tftpboot k" not in commands
+        return
 
     expected_mtdparts = nor_mtdparts(16)
 

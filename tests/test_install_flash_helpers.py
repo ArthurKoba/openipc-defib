@@ -10,6 +10,7 @@ from defib.install.layout import (
     nor_bootargs,
     nor_layout,
     nor_mtdparts,
+    parse_uboot_crc32,
     set_uboot_env_verified,
     uboot_flash_command_error,
 )
@@ -29,8 +30,16 @@ def test_align_up_rejects_invalid_alignment():
 def test_detect_nor_size_from_hisilicon_sf_probe_formats():
     assert detect_nor_size_mb('Spi(cs1): Block:64KB Chip:16MB Name:"GD25Q128"') == 16
     assert detect_nor_size_mb("spi size: 16MB") == 16
+    assert detect_nor_size_mb("SPI Nor total size: 16MB") == 16
+    assert detect_nor_size_mb("SF: Detected GD25Q128 with total 16MB") == 16
     assert detect_nor_size_mb("16384 KiB hi_sfc at 0:0 is now current device") == 16
     assert detect_nor_size_mb("unhelpful output") is None
+
+
+def test_parse_uboot_crc32_requires_complete_checksum():
+    assert parse_uboot_crc32("CRC32 for 82000000 ... ==> DEADBEEF\nOpenIPC # ") == 0xDEADBEEF
+    assert parse_uboot_crc32("CRC32 command timed out") is None
+    assert parse_uboot_crc32("==> 1234") is None
 
 
 def test_standard_nor_layout_is_selected_from_detected_capacity():

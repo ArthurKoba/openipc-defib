@@ -81,7 +81,8 @@ variant. For example, HiWatch DS-I203 uses:
 
 ```bash
 defib install -c hi3518ev100:hiwatch-ds-i203 \
-  --firmware hi3518ev100_lite_hiwatch-ds-i203-nor.tgz -p /dev/ttyUSB0
+  --firmware hi3518ev100_lite_hiwatch-ds-i203-nor.tgz \
+  --wipe-env -p /dev/ttyUSB0
 ```
 
 For such selectors, Defib resolves the published U-Boot variant through the
@@ -89,7 +90,9 @@ normal OpenIPC release/cache mechanism. Hikvision Ctrl+U / `HKVS #` / YMODEM
 handling lives in `defib.vendors.hikvision`. The registry also carries any
 installer-only runtime environment required to complete the migration (for the
 DS-I203, `phyaddru=3` so the chainloaded U-Boot can use TFTP). These values are
-transient and disappear when Defib erases the old persistent environment before rebooting the freshly flashed U-Boot.
+transient and disappear when Defib replaces the old persistent environment.
+Stock-U-Boot NOR migrations require explicit `--wipe-env`; Defib refuses to
+start that migration otherwise, and restores the captured factory `ethaddr`.
 
 The release U-Boot owns boot-critical hardware initialization such as DDR
 cold-init and RAM probing limits. Defib owns the layout it actually flashes: it

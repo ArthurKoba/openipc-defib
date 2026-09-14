@@ -106,7 +106,11 @@ class SerialTransport(Transport):
         self._port.reset_input_buffer()
 
     async def flush_output(self) -> None:
-        self._port.reset_output_buffer()
+        # Transport.flush_output() means "wait until queued TX bytes are sent".
+        # pyserial reset_output_buffer() does the opposite: it discards queued
+        # bytes, which can truncate bootloader/YMODEM traffic on USB-UART links.
+        # Serial.flush() blocks until the OS/driver TX queue has drained.
+        await asyncio.get_event_loop().run_in_executor(None, self._port.flush)
 
     async def set_baudrate(self, baud: int) -> None:
         self._port.baudrate = baud

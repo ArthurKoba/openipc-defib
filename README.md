@@ -118,7 +118,7 @@ Handles both `tftpboot` and `tftp` U-Boot commands transparently.
 - All 3 HiSilicon/Goke UART protocols (Standard, V500, CV6xx)
 - 120+ supported SoC chips
 - Full firmware install via UART + TFTP with CRC32 verification
-- Plugin architecture for future vendor protocols
+- Reusable stock U-Boot bootstrap implementations plus board-specific install profiles
 - Multiple interfaces: CLI, TUI, Web UI, JSON for automation
 - Multi-file TFTP server with filename-based routing
 - UART session capture/replay (.dcap format)

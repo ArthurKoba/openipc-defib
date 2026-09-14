@@ -5,8 +5,12 @@ import re
 from defib.uboot_env import (
     OPENIPC_DEFAULT_ETHADDR,
     generate_locally_administered_mac,
+    env_values_equivalent,
+    expand_env_references,
     is_unset_or_default_ethaddr,
+    parse_printenv,
     parse_printenv_value,
+    select_install_ethaddr,
 )
 
 _MAC_RE = re.compile(r"^([0-9a-f]{2}:){5}[0-9a-f]{2}$")
@@ -104,3 +108,80 @@ def test_default_const_is_what_we_observed():
     # binaries (hi3516av200 + hi3516cv300). If OpenIPC ever changes the
     # baked-in default, this test breaks loudly so we know to update.
     assert OPENIPC_DEFAULT_ETHADDR == "00:00:23:34:45:66"
+
+
+def test_parse_full_printenv_preserves_shell_commands():
+    response = (
+        "OpenIPC # printenv\n"
+        "bootcmd=sf probe 0; sf read ${baseaddr} 0x70000 0x380000; bootm ${baseaddr}\n"
+        "bootargs=mem=128M console=ttyAMA0,115200 root=/dev/mtdblock5 rootfstype=squashfs ro\n"
+        "ethaddr=18:68:cb:6b:e6:64\n"
+        "Environment size: 1234/65532 bytes\n"
+        "OpenIPC # \n"
+    )
+    env = parse_printenv(response)
+    assert env["bootcmd"] == (
+        "sf probe 0; sf read ${baseaddr} 0x70000 0x380000; bootm ${baseaddr}"
+    )
+    assert env["ethaddr"] == "18:68:cb:6b:e6:64"
+    assert "mdio_intf" not in env
+
+
+def test_parse_full_printenv_ignores_non_assignments_and_keeps_first_equals_in_value():
+    response = "prompt\nfoo=a=b=c\n## Error: nope\nbar= baz qux \n"
+    assert parse_printenv(response) == {"foo": "a=b=c", "bar": "baz qux"}
+
+
+def test_expand_env_references_uses_captured_snapshot():
+    env = {"baseaddr": "0x82000000"}
+    assert expand_env_references(
+        "sf probe 0; sf read ${baseaddr} 0x70000 0x380000; bootm ${baseaddr}",
+        env,
+    ) == "sf probe 0; sf read 0x82000000 0x70000 0x380000; bootm 0x82000000"
+
+
+def test_env_values_equivalent_accepts_legacy_setenv_expansion():
+    env = {"baseaddr": "0x82000000"}
+    expected = "sf probe 0; sf read ${baseaddr} 0x70000 0x380000; bootm ${baseaddr}"
+    actual = "sf probe 0; sf read 0x82000000 0x70000 0x380000; bootm 0x82000000"
+    assert env_values_equivalent(expected, actual, env)
+
+
+def test_env_values_equivalent_rejects_wrong_expanded_address():
+    env = {"baseaddr": "0x82000000"}
+    expected = "bootm ${baseaddr}"
+    assert not env_values_equivalent(expected, "bootm 0x83000000", env)
+
+
+def test_env_values_equivalent_does_not_hide_missing_reference():
+    env = {}
+    assert not env_values_equivalent("bootm ${baseaddr}", "bootm 0x82000000", env)
+
+
+class TestSelectInstallEthaddr:
+    def test_preserved_factory_mac_wins(self):
+        value, source = select_install_ethaddr(
+            "02:aa:bb:cc:dd:ee", "18:68:cb:6b:e6:64", allow_generate=False
+        )
+        assert value == "18:68:cb:6b:e6:64"
+        assert source == "preserved"
+
+    def test_current_valid_mac_is_kept_without_factory_value(self):
+        value, source = select_install_ethaddr(
+            "02:aa:bb:cc:dd:ee", None, allow_generate=False
+        )
+        assert value == "02:aa:bb:cc:dd:ee"
+        assert source == "current"
+
+    def test_vendor_install_refuses_to_invent_missing_identity(self):
+        value, source = select_install_ethaddr(
+            OPENIPC_DEFAULT_ETHADDR, None, allow_generate=False
+        )
+        assert value is None
+        assert source == "missing"
+
+    def test_generic_install_can_generate_rescue_mac(self):
+        value, source = select_install_ethaddr(None, None, allow_generate=True)
+        assert value is not None
+        assert _MAC_RE.match(value)
+        assert source == "generated"

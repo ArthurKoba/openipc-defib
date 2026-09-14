@@ -6,6 +6,15 @@ from typing import Any
 
 import typer
 
+from defib.install import layout as _install_layout
+
+# Compatibility aliases for existing private imports. Install implementation
+# lives in defib.install.layout; CLI code does not own these helpers.
+_NAND_LAYOUT = _install_layout.NAND_LAYOUT
+_NOR8M_LAYOUT = _install_layout.NOR8M_LAYOUT
+_NOR16M_LAYOUT = _install_layout.NOR16M_LAYOUT
+_nand_bootargs = _install_layout.nand_bootargs
+
 app = typer.Typer(
     name="defib",
     help="Universal camera recovery tool - shocking dead devices back to life.",
@@ -2139,8 +2148,14 @@ def _parse_size(s: str) -> int:
 
 @app.command()
 def install(
-    chip: str = typer.Option(..., "-c", "--chip", help="Chip model name"),
-    firmware: str = typer.Option(..., "--firmware", help="OpenIPC firmware tarball (.tgz)"),
+    chip: str = typer.Option(..., "-c", "--chip", help="Chip or chip:U-Boot variant"),
+    firmware: str = typer.Option(
+        ..., "--firmware", help="OpenIPC firmware tarball (.tgz)"
+    ),
+    uboot: str = typer.Option(
+        "", "--uboot",
+        help="Explicit U-Boot artifact override",
+    ),
     port: str = typer.Option("/dev/ttyUSB0", "-p", "--port", help="Serial device (/dev/ttyUSB0), tcp://host:port, rfc2217://host:port, or socket:///path"),
     power_cycle: bool = typer.Option(False, "--power-cycle", help="Auto power-cycle via PoE"),
     poe_port_override: str = typer.Option("", "--poe-port", help="Explicit MikroTik ether port (e.g. ether3) — overrides comment-based auto-discovery. Requires --power-cycle."),
@@ -2148,13 +2163,24 @@ def install(
     host_ip: str = typer.Option("192.168.1.10", "--host-ip", help="IP to assign to host NIC for TFTP"),
     device_ip: str = typer.Option("192.168.1.20", "--device-ip", help="IP for camera in U-Boot"),
     tftp_port: int = typer.Option(69, "--tftp-port", help="TFTP server port"),
-    nor_size: int = typer.Option(8, "--nor-size", help="NOR flash size in MB (8, 16, or 32)"),
+    nor_size: int = typer.Option(
+        0, "--nor-size",
+        help="NOR size override in MB; 0 auto-detects from U-Boot",
+    ),
     nand: bool = typer.Option(False, "--nand", help="Use NAND flash instead of NOR"),
     wipe_env: bool = typer.Option(
         False, "--wipe-env",
         help="Erase the env partition during U-Boot flash (loses ethaddr; "
              "default is to preserve env so MACs aren't reset to the OpenIPC "
              "u-boot default 00:00:23:34:45:66).",
+    ),
+    final_reset: bool = typer.Option(
+        True,
+        "--final-reset/--no-final-reset",
+        help=(
+            "Reset into OpenIPC when installation completes; "
+            "use --no-final-reset to leave the device at the U-Boot prompt."
+        ),
     ),
     tftp_via: str = typer.Option(
         "auto", "--tftp-via",
@@ -2167,792 +2193,31 @@ def install(
     output: str = typer.Option("human", "--output", help="Output mode: human, json"),
     debug: bool = typer.Option(False, "-d", "--debug", help="Enable debug logging"),
 ) -> None:
-    """Install a full OpenIPC firmware (U-Boot + kernel + rootfs) via UART + TFTP.
-
-    Extracts the firmware tarball, burns U-Boot to RAM via boot ROM,
-    then uses TFTP to transfer kernel and rootfs to U-Boot which
-    flashes them to NOR or NAND.
-    """
+    """Install OpenIPC, including vendor-U-Boot bootstrap when registered."""
     import asyncio
-    asyncio.run(_install_async(
-        chip, firmware, port, power_cycle, poe_port_override, nic, host_ip, device_ip,
-        tftp_port, nor_size, nand, wipe_env, tftp_via, output, debug,
-    ))
 
+    from defib.install import InstallRequest, run_install
 
-# 8MB NOR flash layout (matches U-Boot setnor8m / mtdpartsnor8m)
-_NOR8M_LAYOUT = {
-    "boot":        (0x000000, 0x40000),   # 256KB
-    "env":         (0x040000, 0x10000),   # 64KB
-    "kernel":      (0x050000, 0x200000),  # 2MB
-    "rootfs":      (0x250000, 0x500000),  # 5120KB
-}
-
-# 16MB NOR flash layout (matches U-Boot setnor16m / mtdpartsnor16m)
-_NOR16M_LAYOUT = {
-    "boot":        (0x000000, 0x40000),   # 256KB
-    "env":         (0x040000, 0x10000),   # 64KB
-    "kernel":      (0x050000, 0x300000),  # 3MB
-    "rootfs":      (0x350000, 0xA00000),  # 10240KB
-}
-
-# 32MB NOR flash layout — OpenIPC U-Boot has no setnor32m env var, so we
-# send mtdparts directly. Pattern continues 8m/16m: same boot/env/kernel
-# offsets, larger rootfs to use the extra space.
-_NOR32M_LAYOUT = {
-    "boot":        (0x000000, 0x40000),   # 256KB
-    "env":         (0x040000, 0x10000),   # 64KB
-    "kernel":      (0x050000, 0x300000),  # 3MB
-    "rootfs":      (0x350000, 0x1800000), # 24MB
-}
-
-# NAND flash layout: 1M(boot),1M(env),8M(kernel),-(ubi)
-_NAND_LAYOUT = {
-    "boot":        (0x000000, 0x100000),   # 1MB
-    "env":         (0x100000, 0x100000),   # 1MB
-    "kernel":      (0x200000, 0x800000),   # 8MB
-    "rootfs":      (0xA00000, 0x7600000),  # 118MB (UBI)
-}
-
-
-def _nand_bootargs(rootfs_is_ubi: bool) -> str:
-    """Return kernel cmdline for OpenIPC NAND install.
-
-    Don't rely on U-Boot's compiled-in default bootargs — recent OpenIPC
-    builds default to squashfs+ubiblock, which kernel-panics with
-    "Unable to mount root fs" when the actual rootfs volume contains
-    UBIFS.  Always set bootargs explicitly to match what we wrote.
-
-    The mtdparts substring must agree with the layout we set in U-Boot
-    (1M boot, 1M env, 8M kernel, rest UBI) so ``ubi.mtd=3`` resolves to
-    the right partition.
-    """
-    base = (
-        "mem=256M console=ttyAMA0,115200 panic=20 ubi.mtd=3,2048 "
-        "mtdparts=hinand:1024k(boot),1024k(env),8192k(kernel),-(ubi)"
+    request = InstallRequest(
+        chip=chip,
+        firmware_path=firmware,
+        uboot_path=uboot,
+        port=port,
+        power_cycle=power_cycle,
+        poe_port_override=poe_port_override,
+        nic=nic,
+        host_ip=host_ip,
+        device_ip=device_ip,
+        tftp_port=tftp_port,
+        nor_size=nor_size,
+        nand=nand,
+        wipe_env=wipe_env,
+        final_reset=final_reset,
+        tftp_via=tftp_via,
+        output=output,
+        debug=debug,
     )
-    if rootfs_is_ubi:
-        return f"root=ubi0:rootfs rootfstype=ubifs {base}"
-    # Squashfs on a UBI block device (modern OpenIPC layout)
-    return f"root=/dev/ubiblock0_0 rootfstype=squashfs ubi.block=0,0 init=/init {base}"
-
-
-async def _install_async(
-    chip: str,
-    firmware_path: str,
-    port: str,
-    power_cycle: bool,
-    poe_port_override: str,
-    nic: str,
-    host_ip: str,
-    device_ip: str,
-    tftp_port: int,
-    nor_size: int,
-    nand: bool,
-    wipe_env: bool,
-    tftp_via: str,
-    output: str,
-    debug: bool,
-) -> None:
-    import hashlib
-    import json as json_mod
-    import logging
-    import re as re_mod
-    import tarfile
-    import zlib
-    from pathlib import Path
-
-    from rich.console import Console
-
-    from defib.flashdump import get_ram_staging_addr, send_command
-    from defib.firmware import (
-        download_firmware,
-        get_cached_path,
-        has_firmware,
-        pad_to_size,
-    )
-    from defib.network.ip_manager import list_interfaces_async, temporary_ip
-    from defib.network.tftp_server import start_tftp_server
-    from defib.recovery.events import LogEvent, ProgressEvent
-    from defib.recovery.session import RecoverySession
-    from defib.transport.serial_platform import create_transport, normalize_port_name
-
-    console = Console()
-
-    if debug:
-        logging.basicConfig(level=logging.DEBUG)
-    else:
-        logging.basicConfig(level=logging.INFO)
-
-    if _recovery_mode_or_exit(chip, output) == "usb":
-        # Writing flash over USB is not landed yet: this chip's images have
-        # nowhere correct to go until the UBI-vs-raw rootfs question is
-        # settled, and the write path has never run against hardware. Wake
-        # the board with `burn` and flash it by other means meanwhile.
-        # Routed through _usb_fail so --output json still gets an event.
-        _usb_fail(
-            output,
-            f"{chip} recovers over USB, and `install` does not support that "
-            "yet — use `defib burn` to bring the board up.",
-        )
-        return
-
-    if nand:
-        layout = _NAND_LAYOUT
-        flash_cmd = "nand"
-        flash_label = "NAND"
-    else:
-        if nor_size >= 32:
-            layout = _NOR32M_LAYOUT
-        elif nor_size >= 16:
-            layout = _NOR16M_LAYOUT
-        else:
-            layout = _NOR8M_LAYOUT
-        flash_cmd = "sf"
-        flash_label = f"NOR {nor_size}MB"
-
-    # --- Step 1: Extract firmware tarball ---
-    if output == "human":
-        console.print("[bold]OpenIPC Firmware Install[/bold]")
-        console.print(f"  Chip:  [cyan]{chip}[/cyan]")
-        console.print(f"  Port:  [cyan]{port}[/cyan]")
-        console.print(f"  Flash: [cyan]{flash_label}[/cyan]")
-
-    kernel_data: bytes | None = None
-    rootfs_data: bytes | None = None
-    kernel_name = ""
-    rootfs_name = ""
-
-    with tarfile.open(firmware_path, "r:gz") as tf:
-        for member in tf.getmembers():
-            name = member.name
-            if name.endswith(".md5sum"):
-                continue
-            if name.startswith("uImage"):
-                kernel_name = name
-                f = tf.extractfile(member)
-                assert f is not None
-                kernel_data = f.read()
-            elif name.startswith("rootfs.squashfs") or name.startswith("rootfs.ubi"):
-                rootfs_name = name
-                f = tf.extractfile(member)
-                assert f is not None
-                rootfs_data = f.read()
-
-    if not kernel_data or not rootfs_data:
-        console.print("[red]Tarball missing uImage or rootfs (squashfs/ubi)[/red]")
-        raise typer.Exit(1)
-
-    # Verify md5sums if present
-    with tarfile.open(firmware_path, "r:gz") as tf:
-        for member in tf.getmembers():
-            if not member.name.endswith(".md5sum"):
-                continue
-            f = tf.extractfile(member)
-            assert f is not None
-            expected_line = f.read().decode().strip()
-            expected_md5 = expected_line.split()[0]
-            base_name = member.name.removesuffix(".md5sum")
-            if base_name == kernel_name:
-                actual = hashlib.md5(kernel_data).hexdigest()
-                if actual != expected_md5:
-                    console.print(f"[red]MD5 mismatch for {kernel_name}[/red]")
-                    raise typer.Exit(1)
-            elif base_name == rootfs_name:
-                actual = hashlib.md5(rootfs_data).hexdigest()
-                if actual != expected_md5:
-                    console.print(f"[red]MD5 mismatch for {rootfs_name}[/red]")
-                    raise typer.Exit(1)
-
-    k_off, k_sz = layout["kernel"]
-    r_off, r_sz = layout["rootfs"]
-
-    if len(kernel_data) > k_sz:
-        console.print(f"[red]Kernel too large: {len(kernel_data)} > {k_sz}[/red]")
-        raise typer.Exit(1)
-    if len(rootfs_data) > r_sz:
-        console.print(f"[red]Rootfs too large: {len(rootfs_data)} > {r_sz}[/red]")
-        raise typer.Exit(1)
-
-    if output == "human":
-        console.print(f"  Kernel: [cyan]{kernel_name}[/cyan] ({len(kernel_data)} bytes)")
-        console.print(f"  Rootfs: [cyan]{rootfs_name}[/cyan] ({len(rootfs_data)} bytes)")
-
-    # --- Step 2: Get U-Boot ---
-    if not has_firmware(chip):
-        console.print(f"[red]No OpenIPC U-Boot for '{chip}'[/red]")
-        raise typer.Exit(1)
-
-    cached = get_cached_path(chip)
-    if not cached:
-        if output == "human":
-            console.print(f"  Downloading U-Boot for [cyan]{chip}[/cyan]...")
-        cached = download_firmware(chip)
-
-    uboot_raw = cached.read_bytes()
-    b_off, b_sz = layout["boot"]
-    env_off, env_sz = layout["env"]
-    # OpenIPC publishes raw U-Boot now (issue #73) — pad locally to the
-    # boot partition size so the trailing flash is erased (0xFF), not
-    # left at whatever was previously written.
-    uboot_data = pad_to_size(uboot_raw, b_sz)
-    # Default: erase only the boot partition. Erasing the env partition
-    # destroys any ethaddr that u-boot derived on a previous boot, which
-    # then has the OpenIPC compiled-in default 00:00:23:34:45:66 saved
-    # back in its place at the saveenv at the end of install — that's
-    # how multiple cameras converge on the same MAC.  --wipe-env opts
-    # back into the old behavior when a clean env is wanted.
-    uboot_flash_size = b_sz + env_sz if wipe_env else b_sz
-
-    if output == "human":
-        if len(uboot_raw) == len(uboot_data):
-            console.print(f"  U-Boot: [cyan]{cached.name}[/cyan] ({len(uboot_data)} bytes)")
-        else:
-            console.print(
-                f"  U-Boot: [cyan]{cached.name}[/cyan] "
-                f"({len(uboot_raw)} bytes → padded to {len(uboot_data)})"
-            )
-
-    # --- Step 3: Power cycle + burn U-Boot to RAM ---
-    power_controller = None
-    poe_port = None
-    if power_cycle:
-        from defib.power.factory import power_controller_from_env
-        from defib.power.routeros import RouterOSController
-        try:
-            power_controller = power_controller_from_env()
-        except Exception as e:
-            console.print(f"[red]Power controller error:[/red] {e}")
-            raise typer.Exit(1)
-
-        if isinstance(power_controller, RouterOSController):
-            if poe_port_override:
-                poe_port = poe_port_override
-                if output == "human":
-                    console.print(f"  PoE: [cyan]{poe_port}[/cyan] (explicit)")
-            else:
-                port_basename = Path(port).name
-                device_label = port_basename.removeprefix("uart-") if port_basename.startswith("uart-") else port_basename
-                try:
-                    poe_port = await power_controller.find_port_by_comment(device_label)
-                except Exception as e:
-                    console.print(f"[red]PoE port discovery failed:[/red] {e}")
-                    await power_controller.close()
-                    raise typer.Exit(1)
-
-                if output == "human":
-                    console.print(f"  PoE: [cyan]{poe_port}[/cyan]")
-        else:
-            poe_port = ""
-            if output == "human":
-                console.print(f"  Power: [cyan]{power_controller.name()}[/cyan]")
-
-    # Detect rack-pod power: the pod runs the SPL/DDR/U-Boot upload
-    # locally, requires exclusive UART, so we open the transport AFTER.
-    from defib.power.rack import RackController
-    use_rack_fastboot = isinstance(power_controller, RackController)
-
-    session = RecoverySession(
-        chip=chip, firmware_path=str(cached),
-        power_controller=power_controller, poe_port=poe_port,
-    )
-
-    if output == "human":
-        console.print("\n[bold yellow]Phase 1: Burning U-Boot to RAM[/bold yellow]")
-        if not power_cycle:
-            console.print("  [yellow]Power-cycle the camera now![/yellow]")
-
-    transport = None
-    if not use_rack_fastboot:
-        transport = await create_transport(normalize_port_name(port))
-
-        # Vectis: share the TCP transport for RTS/DTR delivery (see burn).
-        # Vectis only allows one TCP client; if we don't attach the live
-        # transport here, the controller's standalone path opens a SECOND
-        # connection which evicts the recovery session's first one mid-flow
-        # and kills its reader thread with SerialException.
-        if power_controller is not None:
-            from defib.power.vectis import VectisController
-            from defib.transport.rfc2217 import Rfc2217Transport
-            from defib.transport.socket import SocketTransport
-            if isinstance(power_controller, VectisController) and isinstance(
-                transport, (Rfc2217Transport, SocketTransport)
-            ):
-                power_controller.attach_transport(transport)
-
-    def on_log(event: LogEvent) -> None:
-        if output == "human":
-            style = {"error": "red", "warn": "yellow", "info": "green"}.get(event.level, "")
-            console.print(f"  [{style}]{event.message}[/{style}]")
-
-    def on_progress(event: ProgressEvent) -> None:
-        if output == "human" and event.message:
-            console.print(f"  {event.message}")
-
-    if use_rack_fastboot:
-        from defib.recovery.rack_fastboot import run_rack_fastboot
-        assert isinstance(power_controller, RackController)
-        on_log(LogEvent(level="info", message="Pod-side fastboot in progress…"))
-        result = await run_rack_fastboot(
-            power_controller, chip, cached.read_bytes(),
-        )
-        if result.success:
-            transport = await create_transport(normalize_port_name(port))
-    else:
-        assert transport is not None  # opened above when not use_rack_fastboot
-        result = await session.run(
-            transport,
-            on_progress=on_progress,
-            on_log=on_log,
-            send_break=False,
-        )
-
-    if not result.success:
-        console.print(f"[red]Burn failed:[/red] {result.error}")
-        if transport is not None:
-            await transport.close()
-        if power_controller:
-            await power_controller.close()
-        raise typer.Exit(1)
-    assert transport is not None  # success ⇒ transport opened
-
-    if output == "human":
-        console.print(f"  [green]U-Boot loaded in {result.elapsed_ms:.0f}ms[/green]")
-
-    # --- Step 3.5: Detect U-Boot mode (download_process or shell) ---
-    # Must happen here (not in session.run) to detect download_process mode.
-    import asyncio as _aio
-    import time as _time_mod
-
-    buf = bytearray()
-    start_detect = _time_mod.monotonic()
-    download_mode = False
-
-    while _time_mod.monotonic() - start_detect < 15:
-        await transport.write(b"\x03")
-        try:
-            det_data = await transport.read(256, timeout=0.2)
-            buf.extend(det_data)
-            text = buf.decode("ascii", errors="replace")
-            if "start download process" in text:
-                download_mode = True
-                break
-            if "autoboot" in text.lower():
-                if output == "human":
-                    console.print("  Autoboot detected, sending Ctrl-C...")
-                for _ in range(20):
-                    await transport.write(b"\x03")
-                    await _aio.sleep(0.1)
-                break
-            tail = text[-256:] if len(text) > 256 else text
-            if "hisilicon #" in tail or "OpenIPC #" in tail or "\n=> " in tail:
-                break
-        except Exception:
-            pass
-
-    if download_mode:
-        if output == "human":
-            console.print("  [cyan]Download command mode detected[/cyan]")
-        from defib.protocol.download_cmd import DownloadCommandClient
-        dl_client = DownloadCommandClient(transport)
-
-        async def _cmd(cmd: str, timeout: float = 60.0, **kw: object) -> str:
-            ok, out = await dl_client.send_command(cmd, timeout=timeout)
-            if not ok and output == "human":
-                console.print(f"  [yellow]Warning: {cmd} → ERROR[/yellow]")
-            return out
-    else:
-        if output == "human":
-            console.print("  [cyan]U-Boot shell mode[/cyan]")
-
-        async def _cmd(cmd: str, timeout: float = 60.0, **kw: object) -> str:
-            return await send_command(transport, cmd, timeout=timeout, wait_for="# ")
-
-    # --- Step 4: U-Boot console — probe flash ---
-    if output == "human":
-        console.print("\n[bold yellow]Phase 2: Flash via TFTP[/bold yellow]")
-
-    ram_addr = get_ram_staging_addr(chip)
-
-    if nand:
-        resp = await _cmd("nand info", timeout=5.0)
-        if "error" in resp.lower() or "no nand" in resp.lower():
-            console.print(f"[red]NAND detection failed:[/red] {resp.strip()}")
-            await transport.close()
-            raise typer.Exit(1)
-        if output == "human":
-            console.print("  [green]NAND flash detected[/green]")
-    else:
-        resp = await _cmd("sf probe 0", timeout=5.0)
-        if "error" in resp.lower() or "fail" in resp.lower():
-            console.print(f"[red]sf probe failed:[/red] {resp.strip()}")
-            await transport.close()
-            raise typer.Exit(1)
-        if output == "human":
-            console.print("  [green]SPI flash detected[/green]")
-
-    # --- Step 5: Pick a TFTP backend, stage / start, then drive U-Boot ---
-    #
-    # Two paths:
-    #   * pod    — stage firmware bytes in the rack pod's PSRAM via
-    #              RackController.tftp_put; camera fetches from the pod's
-    #              W5500 IP (192.168.1.1). Zero host setup; the pod is
-    #              already on the camera's local LAN.
-    #   * host   — defib starts an embedded TFTP server on the host's
-    #              `nic` at `host_ip`. Needs sudo / port-69 / NIC plumbing.
-    #
-    # `--tftp-via auto` picks pod when power=rack, host otherwise.
-    use_pod_tftp = (
-        tftp_via == "pod"
-        or (tftp_via == "auto" and isinstance(power_controller, RackController))
-    )
-    if tftp_via == "pod" and not isinstance(power_controller, RackController):
-        console.print(
-            "[red]--tftp-via pod requires DEFIB_POWER_TYPE=rack[/red] "
-            "(no rack pod to host TFTP)."
-        )
-        await transport.close()
-        raise typer.Exit(1)
-
-    # TFTP files: U-Boot, kernel, rootfs
-    tftp_files = {
-        "u-boot.bin": uboot_data,
-        kernel_name: kernel_data,
-        rootfs_name: rootfs_data,
-    }
-
-    # --tftp-via=auto pre-flight: if the pod doesn't have enough
-    # contiguous PSRAM for the firmware, fall back to host TFTP.
-    # Surfaces "too-big rootfs" cleanly instead of OOMing the staging
-    # POST mid-way.  --tftp-via=pod stays strict (error on OOM, no
-    # silent fallback).
-    if use_pod_tftp and tftp_via == "auto":
-        assert isinstance(power_controller, RackController)
-        total_bytes = sum(len(d) for d in tftp_files.values())
-        fits, pod_stats = await power_controller.psram_can_fit(total_bytes)
-        if not fits:
-            _raw = pod_stats.get("psram_largest_free_block", 0)
-            largest = int(_raw) if isinstance(_raw, (int, float)) else 0
-            if output == "human":
-                console.print(
-                    f"  [yellow]Pod PSRAM has {largest // 1024} KB contiguous free, "
-                    f"need {total_bytes // 1024} KB for this install — falling back "
-                    f"to host TFTP.[/yellow]"
-                )
-            use_pod_tftp = False
-
-    if not use_pod_tftp:
-        # Host TFTP needs a NIC + host_ip; pod path needs neither.
-        if not nic:
-            interfaces = await list_interfaces_async()
-            if interfaces:
-                nic = interfaces[0]
-            else:
-                console.print("[red]No network interfaces found. Specify --nic.[/red]")
-                await transport.close()
-                raise typer.Exit(1)
-        if output == "human":
-            console.print(f"  NIC: [cyan]{nic}[/cyan], Host IP: [cyan]{host_ip}[/cyan]")
-
-    from contextlib import AsyncExitStack
-    async with AsyncExitStack() as stack:
-        # Set up the TFTP backend.  Both branches end up with:
-        #   serverip          — U-Boot's `setenv serverip` value
-        #   replace_in_tftp() — async hook to swap a file mid-flow
-        #                       (used by the UBI rootfs path below)
-        tftp_protocol = None  # only used by host path's UBI replace
-        if use_pod_tftp:
-            assert isinstance(power_controller, RackController)
-            if output == "human":
-                console.print(
-                    f"  [cyan]Staging {sum(len(d) for d in tftp_files.values()) // 1024} KB "
-                    f"in pod PSRAM via POST /tftp/<name>...[/cyan]"
-                )
-            for name, data in tftp_files.items():
-                await power_controller.tftp_put(name, data, timeout=180.0)
-            serverip = "192.168.1.1"
-            tftp_pod = power_controller
-
-            async def _aclose_pod_tftp() -> None:
-                try:
-                    await tftp_pod.tftp_clear()
-                except Exception:
-                    pass
-
-            stack.push_async_callback(_aclose_pod_tftp)
-
-            async def replace_in_tftp(name: str, data: bytes) -> None:
-                await tftp_pod.tftp_put(name, data, timeout=180.0)
-
-            if output == "human":
-                console.print(f"  [green]Pod TFTP ready on {serverip}:69[/green]")
-        else:
-            await stack.enter_async_context(
-                temporary_ip(nic, host_ip, "255.255.255.0")
-            )
-            if output == "human":
-                console.print("  [green]IP assigned[/green]")
-
-            tftp_transport, tftp_protocol = await start_tftp_server(
-                files=tftp_files,
-                bind_addr=host_ip,
-                port=tftp_port,
-                done_count=3,  # U-Boot + kernel + rootfs
-            )
-            stack.callback(tftp_transport.close)
-            serverip = host_ip
-
-            async def replace_in_tftp(name: str, data: bytes) -> None:
-                tftp_protocol._files[name] = data
-
-            if output == "human":
-                console.print(
-                    f"  [green]TFTP server started on {host_ip}:{tftp_port}[/green]"
-                )
-
-        # ── U-Boot console drive (identical for both backends, only
-        #    `serverip` and `replace_in_tftp` differ) ─────────────────
-        try:
-            # Configure U-Boot networking
-            await _cmd(f"setenv ipaddr {device_ip}", timeout=3.0)
-            await _cmd(f"setenv serverip {serverip}", timeout=3.0)
-
-            if output == "human":
-                console.print(f"  Device IP: [cyan]{device_ip}[/cyan]")
-
-            async def _tftp_to_ram(filename: str, timeout: float = 120.0) -> str:
-                """TFTP download using _cmd (supports download mode)."""
-                resp = await _cmd(f"tftpboot 0x{ram_addr:x} {filename}", timeout=timeout)
-                if "unknown command" in resp.lower():
-                    resp = await _cmd(f"tftp 0x{ram_addr:x} {filename}", timeout=timeout)
-                if "done" not in resp.lower() and "bytes transferred" not in resp.lower():
-                    raise RuntimeError(f"TFTP download failed: {resp.strip()[-200:]}")
-                return resp
-
-            async def tftp_and_flash(
-                name: str, tftp_name: str, orig_data: bytes,
-                flash_off: int, erase_sz: int,
-            ) -> None:
-                """TFTP download, flash write, and CRC verify."""
-                if output == "human":
-                    console.print(f"\n  [bold]Flashing {name}[/bold] → 0x{flash_off:X} ({len(orig_data)} bytes)")
-
-                try:
-                    resp = await _tftp_to_ram(tftp_name, timeout=120.0)
-                except RuntimeError as e:
-                    console.print(f"[red]TFTP failed for {name}:[/red] {e}")
-                    raise typer.Exit(1)
-
-                # Verify TFTP transfer in RAM before writing to flash
-                expected_crc = zlib.crc32(orig_data) & 0xFFFFFFFF
-                resp = await _cmd(
-                    f"crc32 0x{ram_addr:x} 0x{len(orig_data):x}",
-                    timeout=10.0,
-                )
-                m = re_mod.search(r"==>\s*([0-9a-fA-F]{8})", resp)
-                if m:
-                    ram_crc = int(m.group(1), 16)
-                    if ram_crc != expected_crc:
-                        console.print(
-                            f"[red]{name} CRC mismatch after TFTP![/red] "
-                            f"expected={expected_crc:08X} got={ram_crc:08X}"
-                        )
-                        raise typer.Exit(1)
-                    if output == "human":
-                        console.print(f"    TFTP CRC verified: {ram_crc:08X}")
-
-                erase_timeout = 120.0 if nand else 60.0
-                await _cmd(
-                    f"{flash_cmd} erase 0x{flash_off:x} 0x{erase_sz:x}",
-                    timeout=erase_timeout,
-                )
-                # NAND requires page-aligned write sizes (2KB pages)
-                write_sz = len(orig_data)
-                if nand:
-                    write_sz = ((write_sz + 2047) // 2048) * 2048
-                await _cmd(
-                    f"{flash_cmd} write 0x{ram_addr:x} 0x{flash_off:x} 0x{write_sz:x}",
-                    timeout=120.0 if nand else 60.0,
-                )
-
-                # Verify flash write by reading back and checking CRC.
-                # Skip for NAND — ECC/OOB makes raw read-back differ from
-                # the original data; the TFTP-to-RAM CRC above is sufficient.
-                if not nand:
-                    await _cmd(
-                        f"{flash_cmd} read 0x{ram_addr:x} 0x{flash_off:x} 0x{len(orig_data):x}",
-                        timeout=30.0,
-                    )
-                    resp = await _cmd(
-                        f"crc32 0x{ram_addr:x} 0x{len(orig_data):x}",
-                        timeout=10.0,
-                    )
-                    m = re_mod.search(r"==>\s*([0-9a-fA-F]{8})", resp)
-                    if m:
-                        flash_crc = int(m.group(1), 16)
-                        if flash_crc != expected_crc:
-                            console.print(
-                                f"[red]{name} flash verify failed![/red] "
-                                f"expected={expected_crc:08X} got={flash_crc:08X}"
-                            )
-                            raise typer.Exit(1)
-                        if output == "human":
-                            console.print(f"    Flash verified: {flash_crc:08X}")
-
-                if output == "human":
-                    console.print(f"  [green]{name} OK[/green]")
-
-            await tftp_and_flash("U-Boot", "u-boot.bin", uboot_data, b_off, uboot_flash_size)
-            await tftp_and_flash("kernel", kernel_name, kernel_data, k_off, k_sz)
-
-            # For NAND: raw UBI images must be written via ubi write, not nand write.
-            # nand write skips bad blocks, shifting data and corrupting UBIFS inside.
-            from defib.ubi import extract_ubifs, is_ubi_image
-
-            if nand and is_ubi_image(rootfs_data):
-                if output == "human":
-                    console.print(
-                        f"\n  [bold]Flashing rootfs (UBI)[/bold] → 0x{r_off:X}"
-                        f" ({len(rootfs_data)} bytes)"
-                    )
-
-                # Extract UBIFS volume data from raw UBI image
-                ubifs_data = extract_ubifs(rootfs_data)
-                if output == "human":
-                    console.print(
-                        f"    Extracted UBIFS: {len(ubifs_data)} bytes"
-                        f" from {len(rootfs_data)} byte UBI image"
-                    )
-
-                # Replace TFTP file with extracted UBIFS — works for
-                # both host (dict reassignment) and pod (HTTP repost).
-                await replace_in_tftp(rootfs_name, ubifs_data)
-
-                try:
-                    resp = await _tftp_to_ram(rootfs_name, timeout=120.0)
-                except RuntimeError as e:
-                    console.print(f"[red]TFTP failed for rootfs:[/red] {e}")
-                    raise typer.Exit(1)
-                if output == "human":
-                    console.print("    TFTP OK")
-
-                # Erase the full rootfs partition
-                await _cmd(f"nand erase 0x{r_off:x} 0x{r_sz:x}", timeout=120.0)
-
-                # UBI format + create volume + write
-                # mtdparts for OpenIPC NAND: hinand:1M(boot),1M(env),8M(kernel),-(ubi)
-                nand_name = "hinand"
-                await _cmd(f"setenv mtdids nand0={nand_name}", timeout=3.0)
-                await _cmd(
-                    f"setenv mtdparts mtdparts={nand_name}:"
-                    f"1024k(boot),1024k(env),8192k(kernel),-(ubi)",
-                    timeout=3.0,
-                )
-                await _cmd("mtdparts", timeout=3.0)
-                await _cmd("ubi part ubi", timeout=120.0)
-                # Create volume using all available space (not just image size)
-                # so UBIFS has room for runtime writes
-                await _cmd("ubi create rootfs", timeout=60.0)
-                resp = await _cmd(
-                    f"ubi write 0x{ram_addr:x} rootfs 0x{len(ubifs_data):x}",
-                    timeout=300.0,
-                )
-                if "error" in resp.lower() or "cannot" in resp.lower():
-                    console.print(f"[red]ubi write failed:[/red] {resp.strip()[-120:]}")
-                    raise typer.Exit(1)
-
-                if output == "human":
-                    console.print("  [green]rootfs (UBI) OK[/green]")
-            else:
-                await tftp_and_flash("rootfs", rootfs_name, rootfs_data, r_off, r_sz)
-
-            # Set up proper boot environment
-            if nand:
-                if output == "human":
-                    console.print("\n  [bold]Setting boot environment[/bold] (NAND)")
-                # Set mtdparts and bootcmd directly — don't rely on env macros
-                # which may be wrong or missing on the target device.
-                # Layout: 1M(boot),1M(env),8M(kernel),-(ubi)
-                await _cmd(
-                    "setenv mtdparts hinand:1024k(boot),1024k(env),8192k(kernel),-(ubi)",
-                    timeout=3.0,
-                )
-                await _cmd(
-                    r"setenv bootcmd nand read ${baseaddr} 0x200000 0x800000\; bootm ${baseaddr}",
-                    timeout=3.0,
-                )
-                # Match bootargs to actual rootfs format — see _nand_bootargs.
-                bootargs = _nand_bootargs(rootfs_is_ubi=is_ubi_image(rootfs_data))
-                await _cmd(f"setenv bootargs {bootargs}", timeout=3.0)
-            else:
-                if output == "human":
-                    console.print("\n  [bold]Setting boot environment[/bold]")
-                # OpenIPC U-Boot defines mtdpartsnor{8,16}m env vars but
-                # not 32m — for 32MB, send the raw mtdparts string.
-                if nor_size >= 32:
-                    mtdparts = (
-                        "hi_sfc:256k(boot),64k(env),3072k(kernel),"
-                        "24576k(rootfs),-(rootfs_data)"
-                    )
-                    await _cmd(f"setenv mtdparts {mtdparts}", timeout=3.0)
-                else:
-                    mtdparts_var = f"mtdpartsnor{nor_size}m"
-                    await _cmd(f"run {mtdparts_var}", timeout=3.0)
-                await _cmd("setenv bootcmd ${bootcmdnor}", timeout=3.0)
-
-            # Rescue ethaddr before saveenv. OpenIPC u-boot's compiled-in
-            # default env carries ethaddr=00:00:23:34:45:66; if u-boot
-            # loaded that default (because the env partition was empty
-            # or just got erased by --wipe-env), saveenv would persist
-            # the bogus MAC and every fresh camera in a fleet would
-            # converge on it. Replace with a locally-administered random
-            # MAC if we see the default or nothing valid.
-            from defib.uboot_env import (
-                generate_locally_administered_mac,
-                is_unset_or_default_ethaddr,
-                parse_printenv_value,
-            )
-            eth_resp = await _cmd("printenv ethaddr", timeout=5.0)
-            current_eth = parse_printenv_value(eth_resp, "ethaddr")
-            if is_unset_or_default_ethaddr(current_eth):
-                new_mac = generate_locally_administered_mac()
-                if output == "human":
-                    if current_eth:
-                        console.print(
-                            f"  ethaddr was [yellow]{current_eth}[/yellow] "
-                            f"(OpenIPC default) — assigning [cyan]{new_mac}[/cyan]"
-                        )
-                    else:
-                        console.print(
-                            f"  ethaddr unset — assigning [cyan]{new_mac}[/cyan]"
-                        )
-                await _cmd(f"setenv ethaddr {new_mac}", timeout=3.0)
-            elif output == "human":
-                console.print(f"  ethaddr preserved: [cyan]{current_eth}[/cyan]")
-
-            resp = await _cmd("saveenv", timeout=10.0)
-            if output == "human":
-                console.print("  [green]Environment saved[/green]")
-
-            # Reset
-            if output == "human":
-                console.print("\n  [bold]Resetting device...[/bold]")
-            await _cmd("reset", timeout=3.0)
-
-        except Exception:
-            raise
-        # The AsyncExitStack handles closing the host TFTP transport and
-        # clearing pod TFTP state — no per-branch finally needed here.
-
-    await transport.close()
-    if power_controller:
-        await power_controller.close()
-
-    if output == "human":
-        console.print("\n[green bold]Install complete![/green bold] Device is rebooting into OpenIPC.")
-    elif output == "json":
-        import json as json_mod
-        print(json_mod.dumps({"event": "done", "success": True}))
+    asyncio.run(run_install(request))
 
 
 @app.command()

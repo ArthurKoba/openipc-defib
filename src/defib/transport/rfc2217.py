@@ -167,8 +167,12 @@ class Rfc2217Transport(Transport):
         )
 
     async def flush_output(self) -> None:
+        # Match Transport.flush_output() semantics: wait for queued bytes to
+        # leave the host/bridge instead of discarding them.  pyserial's
+        # reset_output_buffer() aborts pending TX and can truncate bootloader
+        # commands or YMODEM frames.
         await asyncio.get_event_loop().run_in_executor(
-            None, self._port.reset_output_buffer
+            None, self._port.flush
         )
 
     async def close(self) -> None:

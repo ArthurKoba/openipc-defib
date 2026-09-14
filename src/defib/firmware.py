@@ -4,6 +4,7 @@ Downloads pre-built U-Boot binaries from the OpenIPC firmware repository.
 Two asset families are published, and which one applies depends on the SoC:
 
 - Classic SoCs: ``u-boot-{chip}-universal.bin`` — a bare U-Boot image.
+- Selected classic board variants may publish a dedicated U-Boot release asset.
 - CV6xx SoCs: ``boot-{chip}[-{variant}]-nor.bin`` — a composite image
   (GSL + DDR tables + U-Boot) that the bootrom expects as a single blob.
 
@@ -16,8 +17,8 @@ import logging
 import os
 import sys
 import urllib.request
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +56,12 @@ CV6XX_BOOT_VARIANTS: dict[str, tuple[str, ...]] = {
     "hi3519dv500": ("dmeb", "dmebpro"),
     # hi3516cv613 and hi3516dv500 have no published boot image yet.
 }
+
+# Classic SoCs normally use one universal U-Boot per chip. Some hardware
+# needs a different published U-Boot because its DDR cold-init data or memory
+# geometry is incompatible with the generic image. Device selectors map to the
+# matching hardware artifact while the generic per-chip image remains unchanged.
+CLASSIC_UBOOT_VARIANTS: dict[str, dict[str, str]] = {}
 
 # Chip aliases: map chip names to the firmware download name
 # e.g. hi3516ev300 profile resolves to hi3516ev200 internally,
@@ -94,9 +101,7 @@ def _split_variant(chip: str) -> tuple[str, str | None]:
 
 
 def _strip_variant(chip: str) -> str:
-    """Drop the optional ``:variant`` suffix. For classic SoCs the U-Boot
-    binary is per-chip, not per-board, so the suffix is irrelevant; CV6xx is
-    the exception and is resolved by :func:`asset_name` before this is used."""
+    """Drop the optional ``:variant`` suffix for legacy universal cache names."""
     return _split_variant(chip)[0]
 
 
@@ -117,6 +122,10 @@ def asset_name(chip: str) -> str | None:
         if variant in variants:
             return f"boot-{name}-{variant}-nor.bin"
         return None
+
+    classic_variants = CLASSIC_UBOOT_VARIANTS.get(name)
+    if variant is not None and classic_variants is not None:
+        return classic_variants.get(variant)
 
     if name in AVAILABLE_FIRMWARE:
         return f"u-boot-{name}-universal.bin"
@@ -147,9 +156,17 @@ def _legacy_cache_name(chip: str) -> str:
 
 
 def get_cached_path(chip: str) -> Path | None:
-    """Get the path to cached firmware, or None if not cached."""
+    """Get the path to cached firmware, or None if not cached.
+
+    A registered classic board variant must never fall back to the chip-wide
+    universal cache entry: doing so could select incompatible DDR init data.
+    """
     cache_dir = get_cache_dir()
-    candidates = [asset_name(chip), _legacy_cache_name(chip)]
+    base, variant = _split_variant(chip)
+    name = CHIP_TO_FIRMWARE.get(base, base)
+    candidates: list[str | None] = [asset_name(chip)]
+    if not (variant is not None and name in CLASSIC_UBOOT_VARIANTS):
+        candidates.append(_legacy_cache_name(chip))
     for candidate in candidates:
         if not candidate:
             continue
@@ -175,8 +192,7 @@ def pad_to_size(data: bytes, target_size: int, fill: int = 0xFF) -> bytes:
 
 
 def _unavailable_message(chip: str) -> str:
-    """Explain why a chip can't be resolved, naming the variants when the
-    chip is a CV6xx whose board image is ambiguous."""
+    """Explain why a chip/variant cannot be resolved to a published asset."""
     base, _ = _split_variant(chip)
     name = CHIP_TO_FIRMWARE.get(base, base)
     variants = CV6XX_BOOT_VARIANTS.get(name)
@@ -186,6 +202,13 @@ def _unavailable_message(chip: str) -> str:
             f"{len(variants)} different boot images for {name} and they carry "
             f"different DDR settings, so the right one cannot be guessed. "
             f"Use one of: " + ", ".join(f"{name}:{v}" for v in variants)
+            + ". Or use -f/--file to specify a local firmware file."
+        )
+    classic_variants = CLASSIC_UBOOT_VARIANTS.get(name)
+    if classic_variants and _split_variant(chip)[1] is not None:
+        return (
+            f"Unknown U-Boot variant for '{chip}'. Available variants: "
+            + ", ".join(f"{name}:{v}" for v in sorted(classic_variants))
             + ". Or use -f/--file to specify a local firmware file."
         )
     return (

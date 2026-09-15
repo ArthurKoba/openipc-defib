@@ -27,7 +27,7 @@ from defib.vendors.hikvision import (
 from defib.vendors.registry import (
     create_uboot_bootstrap,
     get_stock_uboot_target,
-    list_stock_uboot_variants,
+    list_stock_uboot_selectors,
 )
 
 FACTORY_MAC = "02:00:00:12:34:56"
@@ -45,6 +45,8 @@ class ScriptedTransport(Transport):
         self.closed = False
         self.break_seen = False
         self.ctrl_u_seen = False
+        self.line = bytearray()
+        self.flush_input_calls = 0
 
     def feed(self, data: bytes) -> None:
         self.rx.extend(data)
@@ -61,6 +63,7 @@ class ScriptedTransport(Transport):
     async def write(self, data: bytes) -> None:
         self.tx.append(bytes(data))
         if data == b"\x03\r":
+            self.line.clear()
             if self.mode == "openipc":
                 self.feed(b"OpenIPC #")
             elif self.mode in {"stock", "stock-no-mac", "ymodem-fail", "go-fail"}:
@@ -68,18 +71,37 @@ class ScriptedTransport(Transport):
         elif data == b"\x03" and self.mode == "cold-stock" and not self.break_seen:
             self.break_seen = True
             self.feed(b"Hit Ctrl+u to stop autoboot:  3")
-        elif data == b"\x15" and self.mode == "cold-stock" and not self.ctrl_u_seen:
-            self.ctrl_u_seen = True
-            self.feed(b"\r\nHKVS #")
-        elif data == b"printenv ethaddr\r":
-            if self.mac is None:
-                self.feed(b"## Error: ethaddr not defined\r\nHKVS #")
-            else:
-                self.feed(f"ethaddr={self.mac}\r\nHKVS #".encode())
-        elif data.startswith(b"go ") and self.mode != "go-fail":
-            self.feed(b"\r\nOpenIPC #")
+        elif data == b"\x15" and self.mode == "cold-stock":
+            # Hikvision consumes Ctrl+U at the autoboot gate.  The bootstrap
+            # deliberately sends it for a short interval; once the gate has
+            # opened, repeated interrupt bytes must not become line-editor
+            # input for the first stock-shell command.
+            if not self.ctrl_u_seen:
+                self.ctrl_u_seen = True
+                self.feed(b"\r\nHKVS #")
+        else:
+            for byte in data:
+                if byte == 0x03:
+                    self.line.clear()
+                    continue
+                if byte == 0x0D:
+                    command = self.line.decode("ascii")
+                    self.line.clear()
+                    if command == "printenv ethaddr":
+                        if self.mac is None:
+                            self.feed(b"## Error: ethaddr not defined\r\nHKVS #")
+                        else:
+                            self.feed(f"ethaddr={self.mac}\r\nHKVS #".encode())
+                    elif command.startswith("go ") and self.mode != "go-fail":
+                        self.feed(b"\r\nOpenIPC #")
+                    continue
+                self.line.append(byte)
+                # Hikvision's line editor echoes each printable byte.  The
+                # bootstrap now verifies this before it sends Enter.
+                self.feed(bytes((byte,)))
 
     async def flush_input(self) -> None:
+        self.flush_input_calls += 1
         self.rx.clear()
 
     async def flush_output(self) -> None:
@@ -117,7 +139,7 @@ async def test_ds_i203_final_migration_contract_all_uboot_outcomes(
     # Camera runtime policy stays outside the release U-Boot, while Defib still
     # owns install-time transport and the flash layout it actually writes.
     assert get_stock_uboot_target("hi3518ev100") is None
-    assert list_stock_uboot_variants("hi3518ev100") == ["hiwatch-ds-i203"]
+    assert "hi3518ev100:hiwatch-ds-i203" in list_stock_uboot_selectors()
     assert target.selector == SELECTOR
     assert target.display_name == "HiWatch DS-I203"
     assert target.vendor == "Hikvision"
@@ -164,8 +186,8 @@ async def test_ds_i203_final_migration_contract_all_uboot_outcomes(
             info.size = len(payload)
             archive.addfile(info, io.BytesIO(payload))
     uboot_override = tmp_path / artifact
-    # Release assets are raw U-Boot binaries; the installer pads them to the
-    # fixed 256 KiB boot partition before stock chainload and flashing.
+    # Release assets are raw U-Boot binaries: stock chainload uses the raw
+    # payload, while the later flash write is padded to the 256 KiB partition.
     uboot_override.write_bytes(b"U" * 182580)
 
     class ReachedTransport(RuntimeError):
@@ -227,6 +249,10 @@ async def test_ds_i203_final_migration_contract_all_uboot_outcomes(
         assert b"printenv ethaddr\r" in transport.all_tx
         assert b"loady 0x81000000\r" in transport.all_tx
         assert b"go 0x81000000\r" in transport.all_tx
+        assert b"printenv ethaddr\r" not in transport.tx
+        assert b"loady 0x81000000\r" not in transport.tx
+        assert b"go 0x81000000\r" not in transport.tx
+        assert transport.flush_input_calls >= 1
 
     async def check_cold_stock() -> None:
         transport = ScriptedTransport("cold-stock")
@@ -349,7 +375,278 @@ async def test_install_rejects_oversized_uboot_override_cleanly(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("crc_failure", [None, "tftp", "readback"])
+async def test_stock_migration_rejects_download_mode_before_flash(
+    monkeypatch, tmp_path
+):
+    """Vendor migration must never erase flash from an unexpected command mode."""
+    import defib.vendors.registry
+    from defib.install import orchestrator
+    from defib.recovery.events import RecoveryResult
+    from defib.vendors.base import UBootBootstrapResult
+
+    firmware_tar = tmp_path / "openipc.hi3516cv100-nor-lite.tgz"
+    with tarfile.open(firmware_tar, "w:gz") as archive:
+        for name, payload in (
+            ("uImage.hi3516cv100", b"kernel"),
+            ("rootfs.squashfs.hi3516cv100", b"rootfs"),
+        ):
+            info = tarfile.TarInfo(name)
+            info.size = len(payload)
+            archive.addfile(info, io.BytesIO(payload))
+    uboot_override = tmp_path / "u-boot.bin"
+    uboot_override.write_bytes(b"U" * 4096)
+
+    class DownloadModeTransport(Transport):
+        def __init__(self) -> None:
+            self.rx = bytearray()
+            self.closed = False
+
+        async def read(self, size: int, timeout: float | None = None) -> bytes:
+            if not self.rx:
+                raise TransportTimeout("no data")
+            data = bytes(self.rx[:size])
+            del self.rx[:size]
+            return data
+
+        async def write(self, data: bytes) -> None:
+            if data == b"\x03":
+                self.rx.extend(b"start download process")
+
+        async def flush_input(self) -> None:
+            self.rx.clear()
+
+        async def flush_output(self) -> None:
+            pass
+
+        async def bytes_waiting(self) -> int:
+            return len(self.rx)
+
+        async def close(self) -> None:
+            self.closed = True
+
+    transport = DownloadModeTransport()
+
+    class FakeBootstrap:
+        requires_echo_verification = False
+
+        async def bootstrap(self, uart, firmware, *, filename):
+            return UBootBootstrapResult(recovery=RecoveryResult(success=True))
+
+    async def fake_create_transport(port: str):
+        return transport
+
+    serial_platform = ModuleType("defib.transport.serial_platform")
+    serial_platform.create_transport = fake_create_transport
+    serial_platform.normalize_port_name = lambda port: port
+    monkeypatch.setitem(sys.modules, "defib.transport.serial_platform", serial_platform)
+    monkeypatch.setattr(
+        defib.vendors.registry,
+        "create_uboot_bootstrap",
+        lambda *args, **kwargs: FakeBootstrap(),
+    )
+
+    with pytest.raises(typer.Exit) as exc_info:
+        await orchestrator.run_install(
+            InstallRequest(
+                chip=SELECTOR,
+                firmware_path=str(firmware_tar),
+                uboot_path=str(uboot_override),
+                port="COM15",
+                wipe_env=True,
+                output="json",
+            )
+        )
+
+    assert exc_info.value.exit_code == 1
+    assert transport.closed is True
+
+
+@pytest.mark.asyncio
+async def test_stock_transport_timeout_is_controlled_and_closes_uart(
+    monkeypatch, tmp_path
+):
+    """TransportTimeout from echo/command IO must not escape as a traceback."""
+    import defib.flashdump
+    import defib.vendors.registry
+    from defib.install import orchestrator
+    from defib.recovery.events import RecoveryResult
+    from defib.vendors.base import UBootBootstrapResult
+
+    firmware_tar = tmp_path / "openipc.hi3516cv100-nor-lite.tgz"
+    with tarfile.open(firmware_tar, "w:gz") as archive:
+        for name, payload in (
+            ("uImage.hi3516cv100", b"kernel"),
+            ("rootfs.squashfs.hi3516cv100", b"rootfs"),
+        ):
+            info = tarfile.TarInfo(name)
+            info.size = len(payload)
+            archive.addfile(info, io.BytesIO(payload))
+    uboot_override = tmp_path / "u-boot.bin"
+    uboot_override.write_bytes(b"U" * 4096)
+
+    class ShellTransport(Transport):
+        def __init__(self) -> None:
+            self.rx = bytearray()
+            self.closed = False
+
+        async def read(self, size: int, timeout: float | None = None) -> bytes:
+            if not self.rx:
+                raise TransportTimeout("no data")
+            data = bytes(self.rx[:size])
+            del self.rx[:size]
+            return data
+
+        async def write(self, data: bytes) -> None:
+            if data == b"\x03":
+                self.rx.extend(b"OpenIPC #")
+
+        async def flush_input(self) -> None:
+            self.rx.clear()
+
+        async def flush_output(self) -> None:
+            pass
+
+        async def bytes_waiting(self) -> int:
+            return len(self.rx)
+
+        async def close(self) -> None:
+            self.closed = True
+
+    transport = ShellTransport()
+
+    class FakeBootstrap:
+        requires_echo_verification = True
+
+        async def bootstrap(self, uart, firmware, *, filename):
+            return UBootBootstrapResult(recovery=RecoveryResult(success=True))
+
+    async def fake_create_transport(port: str):
+        return transport
+
+    async def timeout_command(*args, **kwargs):
+        raise TransportTimeout("synthetic command timeout")
+
+    serial_platform = ModuleType("defib.transport.serial_platform")
+    serial_platform.create_transport = fake_create_transport
+    serial_platform.normalize_port_name = lambda port: port
+    monkeypatch.setitem(sys.modules, "defib.transport.serial_platform", serial_platform)
+    monkeypatch.setattr(defib.flashdump, "send_command", timeout_command)
+    monkeypatch.setattr(
+        defib.vendors.registry,
+        "create_uboot_bootstrap",
+        lambda *args, **kwargs: FakeBootstrap(),
+    )
+
+    with pytest.raises(typer.Exit) as exc_info:
+        await orchestrator.run_install(
+            InstallRequest(
+                chip=SELECTOR,
+                firmware_path=str(firmware_tar),
+                uboot_path=str(uboot_override),
+                port="COM15",
+                wipe_env=True,
+                output="json",
+            )
+        )
+
+    assert exc_info.value.exit_code == 1
+    assert transport.closed is True
+
+
+@pytest.mark.asyncio
+async def test_stock_env_verify_failure_before_tftp_closes_uart(monkeypatch, tmp_path):
+    """A bad preserved/transient env readback must still release resources."""
+    from defib.install import orchestrator
+    from defib.recovery.events import RecoveryResult
+    from defib.vendors.base import UBootBootstrapResult
+    import defib.vendors.registry
+
+    firmware_tar = tmp_path / "openipc.hi3516cv100-nor-lite.tgz"
+    with tarfile.open(firmware_tar, "w:gz") as archive:
+        for name, payload in (
+            ("uImage.hi3516cv100", b"kernel"),
+            ("rootfs.squashfs.hi3516cv100", b"rootfs"),
+        ):
+            info = tarfile.TarInfo(name)
+            info.size = len(payload)
+            archive.addfile(info, io.BytesIO(payload))
+    uboot_override = tmp_path / "u-boot.bin"
+    uboot_override.write_bytes(b"U" * 4096)
+
+    class ShellTransport(Transport):
+        def __init__(self) -> None:
+            self.rx = bytearray()
+            self.closed = False
+
+        async def read(self, size: int, timeout: float | None = None) -> bytes:
+            if not self.rx:
+                raise TransportTimeout("no data")
+            data = bytes(self.rx[:size])
+            del self.rx[:size]
+            return data
+
+        async def write(self, data: bytes) -> None:
+            if data == b"\x03":
+                self.rx.extend(b"OpenIPC #")
+
+        async def flush_input(self) -> None:
+            self.rx.clear()
+
+        async def flush_output(self) -> None:
+            pass
+
+        async def bytes_waiting(self) -> int:
+            return len(self.rx)
+
+        async def close(self) -> None:
+            self.closed = True
+
+    transport = ShellTransport()
+
+    class FakeBootstrap:
+        requires_echo_verification = False
+
+        async def bootstrap(self, uart, firmware, *, filename):
+            return UBootBootstrapResult(
+                recovery=RecoveryResult(success=True),
+                preserved_env={"ethaddr": FACTORY_MAC},
+            )
+
+    async def fake_create_transport(port: str):
+        return transport
+
+    async def fail_env_verify(*args, **kwargs):
+        raise RuntimeError("synthetic env verify failure")
+
+    serial_platform = ModuleType("defib.transport.serial_platform")
+    serial_platform.create_transport = fake_create_transport
+    serial_platform.normalize_port_name = lambda port: port
+    monkeypatch.setitem(sys.modules, "defib.transport.serial_platform", serial_platform)
+    monkeypatch.setattr(
+        defib.vendors.registry,
+        "create_uboot_bootstrap",
+        lambda *args, **kwargs: FakeBootstrap(),
+    )
+    monkeypatch.setattr(orchestrator, "set_uboot_env_verified", fail_env_verify)
+
+    with pytest.raises(typer.Exit) as exc_info:
+        await orchestrator.run_install(
+            InstallRequest(
+                chip=SELECTOR,
+                firmware_path=str(firmware_tar),
+                uboot_path=str(uboot_override),
+                port="COM15",
+                wipe_env=True,
+                output="json",
+            )
+        )
+
+    assert exc_info.value.exit_code == 1
+    assert transport.closed is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("crc_failure", [None, "tftp", "readback", "env"])
 async def test_ds_i203_stock_install_persists_detected_layout_but_not_camera_policy(
     monkeypatch, tmp_path, crc_failure
 ):
@@ -428,9 +725,9 @@ async def test_ds_i203_stock_install_persists_detected_layout_but_not_camera_pol
         async def bootstrap(self, uart, firmware, *, filename):
             assert uart is transport
             assert filename == artifact
-            assert len(firmware) == 0x40000
-            assert firmware[: len(raw_uboot)] == raw_uboot
-            assert firmware[len(raw_uboot):] == b"\xff" * (0x40000 - len(raw_uboot))
+            # Chainload the raw release artifact; only the flash write needs
+            # the 0xFF-padded fixed-size boot partition image.
+            assert firmware == raw_uboot
             return UBootBootstrapResult(
                 recovery=RecoveryResult(success=True),
                 preserved_env={"ethaddr": FACTORY_MAC},
@@ -468,6 +765,7 @@ async def test_ds_i203_stock_install_persists_detected_layout_but_not_camera_pol
     commands: list[str] = []
     flash = bytearray(b"\xa5" * 0x1000000)
     ram = b""
+    stored_crc_word: int | None = None
     env_erased = False
     crc_calls = 0
 
@@ -480,7 +778,7 @@ async def test_ds_i203_stock_install_persists_detected_layout_but_not_camera_pol
     async def fake_send_command(
         uart, command: str, timeout: float = 60.0, **kwargs
     ) -> str:
-        nonlocal ram, env_erased, saved_env, env, crc_calls
+        nonlocal ram, env_erased, saved_env, env, crc_calls, stored_crc_word
         assert uart is transport
         commands.append(command)
 
@@ -546,12 +844,38 @@ async def test_ds_i203_stock_install_persists_detected_layout_but_not_camera_pol
                 return "CRC32 command timed out\nOpenIPC # "
             if crc_failure == "readback" and crc_calls == 2:
                 return "CRC32 output truncated\nOpenIPC # "
-            size = int(command.split()[-1], 16)
-            crc = zlib.crc32(ram[:size]) & 0xFFFFFFFF
+            parts = command.split()
+            address = int(parts[1], 16)
+            size = int(parts[2], 16)
+            offset = address - 0x82000000
+            crc = zlib.crc32(ram[offset:offset + size]) & 0xFFFFFFFF
+            if len(parts) == 4:
+                stored_crc_word = crc
             return f"==> {crc:08X}\nOpenIPC # "
+
+        if command.startswith("cmp.l "):
+            header_crc = int.from_bytes(ram[:4], "little")
+            if stored_crc_word == header_crc:
+                return "Total of 1 word(s) were the same\nOpenIPC # "
+            return (
+                f"word at 0x82000000 ({header_crc:08x}) != "
+                f"({(stored_crc_word or 0):08x})\nOpenIPC # "
+            )
 
         if command == "saveenv":
             saved_env = dict(env)
+            env_data = b"\x00".join(
+                f"{key}={value}".encode("ascii")
+                for key, value in sorted(env.items())
+            ) + b"\x00\x00"
+            env_data = env_data.ljust(0x10000 - 4, b"\x00")
+            env_crc = zlib.crc32(env_data) & 0xFFFFFFFF
+            flash[0x40000:0x50000] = env_crc.to_bytes(4, "little") + env_data
+            if crc_failure == "env":
+                # Simulate a short/corrupt SPI persistence after saveenv printed
+                # success.  RAM printenv still looks correct, but the on-flash
+                # environment CRC must reject the install.
+                flash[0x40004] ^= 0x01
             return "Saving Environment to SPI Flash... done\nOpenIPC # "
 
         if command == "reset":
@@ -605,9 +929,13 @@ async def test_ds_i203_stock_install_persists_detected_layout_but_not_camera_pol
         if crc_failure == "tftp":
             assert not any(cmd.startswith("sf erase ") for cmd in commands)
             assert not any(cmd.startswith("sf write ") for cmd in commands)
-        else:
+        elif crc_failure == "readback":
             assert any(cmd.startswith("sf write ") for cmd in commands)
             assert "tftpboot k" not in commands
+        else:
+            assert "saveenv" in commands
+            assert "sf read 0x82000000 0x40000 0x10000" in commands
+            assert any(cmd.startswith("cmp.l 0x82000000 ") for cmd in commands)
         return
 
     expected_mtdparts = nor_mtdparts(16)

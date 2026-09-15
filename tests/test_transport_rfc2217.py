@@ -412,6 +412,13 @@ class TestWriteFlushClose:
         assert t._buf == bytearray()
         port.reset_input_buffer.assert_called_once()
 
+    async def test_flush_output_does_not_purge_or_claim_remote_drain(self) -> None:
+        port = MagicMock()
+        t = Rfc2217Transport(port)
+        await t.flush_output()
+        port.flush.assert_not_called()
+        port.reset_output_buffer.assert_not_called()
+
     async def test_bytes_waiting_includes_local_buffer(self) -> None:
         port = MagicMock()
         port.in_waiting = 7

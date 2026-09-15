@@ -63,66 +63,6 @@ def parse_printenv_value(response: str, var: str) -> str | None:
     return m.group(1).strip() if m else None
 
 
-def parse_printenv(response: str) -> dict[str, str]:
-    """Parse a full ``printenv`` response into an environment mapping.
-
-    Values are kept intact apart from surrounding whitespace, so command
-    strings containing semicolons, ``${var}`` expansions, spaces, or extra
-    equals signs remain valid. Non-assignment lines are ignored.
-    """
-    env: dict[str, str] = {}
-    for raw_line in response.splitlines():
-        line = raw_line.strip()
-        if not line or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        key = key.strip()
-        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
-            continue
-        env[key] = value.strip()
-    return env
-
-def expand_env_references(value: str, env: dict[str, str], *, max_passes: int = 8) -> str:
-    """Expand U-Boot ``${name}`` references using a captured env snapshot.
-
-    Verification needs semantic rather than byte-for-byte comparison because
-    legacy U-Boot may expand variables while executing ``setenv``. Unknown
-    references are intentionally left untouched so a missing variable cannot
-    accidentally verify as an empty string. Expansion is bounded to avoid
-    cycles in malformed environments.
-    """
-    pattern = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
-    result = value
-    for _ in range(max_passes):
-        changed = False
-
-        def repl(match: re.Match[str]) -> str:
-            nonlocal changed
-            name = match.group(1)
-            if name not in env:
-                return match.group(0)
-            changed = True
-            return env[name]
-
-        new_result = pattern.sub(repl, result)
-        result = new_result
-        if not changed:
-            break
-    return result
-
-
-def env_values_equivalent(expected: str, actual: str | None, env: dict[str, str]) -> bool:
-    """Compare environment values after resolving known U-Boot references.
-
-    This keeps verification strict while accepting semantically identical
-    representations such as ``${baseaddr}`` and ``0x82000000`` when the saved
-    snapshot itself proves ``baseaddr=0x82000000``.
-    """
-    if actual is None:
-        return False
-    return expand_env_references(expected, env) == expand_env_references(actual, env)
-
-
 def select_install_ethaddr(
     current: str | None,
     preserved: str | None,

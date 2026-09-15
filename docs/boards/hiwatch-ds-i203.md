@@ -27,10 +27,10 @@ hi3518ev100:hiwatch-ds-i203
     -> u-boot-hi3518ev100-ddr3-256m-universal.bin
 ```
 
-The published artifact is a raw U-Boot binary. Defib pads it with `0xFF` to the
-fixed `0x40000` boot partition before both stock-U-Boot chainload and flashing.
-`--uboot` remains available as an explicit local override for development or
-recovery.
+The published artifact is a raw U-Boot binary. Defib chainloads that raw image
+over YMODEM, then pads it with `0xFF` to the fixed `0x40000` boot partition for
+the flash write. `--uboot` remains available as an explicit local override for
+development or recovery.
 
 Defib owns migration mechanics and install invariants:
 
@@ -62,8 +62,8 @@ The installer obtains NOR capacity from `sf probe`, selects the standard
 8/16/32 MiB layout, writes kernel/rootfs at those offsets, and saves the
 matching `mtdparts` value before reboot. That persistence is required for the
 first Linux boot because the generic U-Boot defaults describe the generic
-8 MiB layout. `--nor-size` remains a manual override and is validated against
-a detected capacity when both are available.
+8 MiB layout. `--nor-size` remains a manual override; when it disagrees with
+detected capacity Defib emits a warning and honours the explicit value.
 
 ## Environment migration
 

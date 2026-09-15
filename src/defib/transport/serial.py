@@ -19,6 +19,9 @@ DEFAULT_BAUDRATE = 115200
 class SerialTransport(Transport):
     """Transport implementation using pyserial for real serial ports."""
 
+    _OUTPUT_DRAIN_TIMEOUT = 5.0
+    _OUTPUT_DRAIN_POLL = 0.01
+
     def __init__(self, port: serial.Serial) -> None:
         self._port = port
 
@@ -109,8 +112,23 @@ class SerialTransport(Transport):
         # Transport.flush_output() means "wait until queued TX bytes are sent".
         # pyserial reset_output_buffer() does the opposite: it discards queued
         # bytes, which can truncate bootloader/YMODEM traffic on USB-UART links.
-        # Serial.flush() blocks until the OS/driver TX queue has drained.
-        await asyncio.get_event_loop().run_in_executor(None, self._port.flush)
+        # Serial.flush()/tcdrain() can block forever on a dead adapter, so poll
+        # pyserial's queued-byte count with a hard deadline instead.
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self._OUTPUT_DRAIN_TIMEOUT
+        while True:
+            try:
+                queued = int(self._port.out_waiting)
+            except (OSError, serial.SerialException) as exc:
+                raise TransportError(f"Serial TX status failed: {exc}") from exc
+            if queued <= 0:
+                return
+            if loop.time() >= deadline:
+                raise TransportTimeout(
+                    "Output drain timeout "
+                    f"({self._OUTPUT_DRAIN_TIMEOUT:.1f}s, {queued} byte(s) still queued)"
+                )
+            await asyncio.sleep(self._OUTPUT_DRAIN_POLL)
 
     async def set_baudrate(self, baud: int) -> None:
         self._port.baudrate = baud

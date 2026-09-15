@@ -41,6 +41,7 @@ RAM_BASE: dict[str, int] = {
     "hi3516dv100": 0x80000000,
     "hi3516dv300": 0x80000000,
     "hi3518": 0x80000000,
+    "hi3518ev100": 0x80000000,
     "hi3518ev200": 0x80000000,
     "hi3520d": 0x80000000,
     "hi3531": 0x80000000,
@@ -88,7 +89,10 @@ def get_ram_staging_addr(chip: str) -> int:
     Looks up the chip's RAM base from the known table, falling back to
     the profile's U-Boot load address if not found.
     """
-    chip_lower = chip.lower()
+    # Board/vendor selectors use ``soc:variant`` but RAM geometry belongs to
+    # the SoC.  Strip the suffix before the exact table lookup so staging does
+    # not depend on the order of the broad legacy prefix fallbacks below.
+    chip_lower = chip.lower().split(":", 1)[0]
     # Direct match
     if chip_lower in RAM_BASE:
         return RAM_BASE[chip_lower] + RAM_STAGING_OFFSET
@@ -194,7 +198,7 @@ async def _cancel_partial_uboot_line(transport: Transport) -> None:
     await _read_until_prompt(transport, timeout=2.0)
 
 
-async def _write_line_with_echo_verify(
+async def write_uboot_line_with_echo_verify(
     transport: Transport,
     cmd: str,
     *,
@@ -228,6 +232,7 @@ async def _write_line_with_echo_verify(
         if mismatch is None:
             # Only execute after the complete line was echoed correctly.
             await transport.write(b"\r")
+            await transport.flush_output()
             logger.debug(
                 "UART command echo verified (%d bytes): %r", len(encoded), cmd
             )
@@ -283,7 +288,7 @@ async def send_command(
     logger.debug("UART CMD: %r", cmd)
 
     if verify_echo:
-        await _write_line_with_echo_verify(transport, cmd)
+        await write_uboot_line_with_echo_verify(transport, cmd)
     else:
         await transport.write((cmd + "\r").encode("ascii"))
 

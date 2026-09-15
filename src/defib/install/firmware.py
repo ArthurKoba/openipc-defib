@@ -18,6 +18,25 @@ class FirmwareBundle:
     rootfs: bytes
 
 
+def uboot_tftp_commands(
+    filename: str,
+    ram_addr: int,
+    *,
+    use_loadaddr: bool,
+) -> tuple[str, str]:
+    """Return primary/fallback U-Boot TFTP commands for one staged file.
+
+    Vendor-U-Boot migrations deliberately use ``loadaddr`` so the command
+    line stays short on fragile legacy UART consoles.  Generic boot-ROM and
+    download-command installs retain the historical explicit RAM address and
+    therefore do not depend on environment read-back formatting.
+    """
+    if use_loadaddr:
+        return f"tftpboot {filename}", f"tftp {filename}"
+    address = f"0x{ram_addr:x}"
+    return f"tftpboot {address} {filename}", f"tftp {address} {filename}"
+
+
 def load_firmware_bundle(path: str | Path) -> FirmwareBundle:
     """Read kernel/rootfs and verify any matching md5sum entries in one pass."""
     kernel_name = ""

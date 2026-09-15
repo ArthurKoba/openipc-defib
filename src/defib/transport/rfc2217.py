@@ -167,13 +167,11 @@ class Rfc2217Transport(Transport):
         )
 
     async def flush_output(self) -> None:
-        # Match Transport.flush_output() semantics: wait for queued bytes to
-        # leave the host/bridge instead of discarding them.  pyserial's
-        # reset_output_buffer() aborts pending TX and can truncate bootloader
-        # commands or YMODEM frames.
-        await asyncio.get_event_loop().run_in_executor(
-            None, self._port.flush
-        )
+        # pyserial's RFC 2217 backend has no remote-TX-drain primitive:
+        # Serial.flush resolves to io.IOBase.flush(), which is a no-op.  Do not
+        # use reset_output_buffer() here because RFC 2217 PURGE_DATA can discard
+        # bytes that were already queued for the remote UART.
+        return
 
     async def close(self) -> None:
         if self._port is not None and self._port.is_open:

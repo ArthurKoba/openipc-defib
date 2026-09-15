@@ -9,9 +9,11 @@ module.
 
 from __future__ import annotations
 
+from typing import NoReturn
+
 import typer
 
-from defib.install.firmware import load_firmware_bundle
+from defib.install.firmware import load_firmware_bundle, uboot_tftp_commands
 from defib.install.layout import (
     NAND_LAYOUT,
     NOR8M_LAYOUT,
@@ -22,8 +24,10 @@ from defib.install.layout import (
     nor_layout,
     nor_mtdparts,
     parse_uboot_crc32,
+    select_nor_size_mb,
     set_uboot_env_verified,
     uboot_flash_command_error,
+    verify_spi_environment_crc,
 )
 from defib.install.model import InstallRequest
 
@@ -36,6 +40,7 @@ async def run_install(request: InstallRequest) -> None:
     from pathlib import Path
 
     from rich.console import Console
+    from rich.markup import escape
 
     from defib.firmware import (
         download_firmware,
@@ -49,8 +54,9 @@ async def run_install(request: InstallRequest) -> None:
     from defib.profiles.loader import recovery_mode
     from defib.recovery.events import LogEvent, ProgressEvent
     from defib.recovery.session import RecoverySession
-    from defib.transport.base import TransportTimeout
+    from defib.transport.base import TransportError, TransportTimeout
     from defib.transport.serial_platform import create_transport, normalize_port_name
+    from defib.uboot_env import parse_printenv_value, select_install_ethaddr
     from defib.vendors.registry import create_uboot_bootstrap, get_stock_uboot_target
 
     console = Console()
@@ -73,6 +79,20 @@ async def run_install(request: InstallRequest) -> None:
     output = request.output
     debug = request.debug
 
+    def fail(message: str, exit_code: int = 1) -> NoReturn:
+        """Emit one CLI-safe install error and stop."""
+        if output == "json":
+            print(json_mod.dumps({"event": "error", "message": message}))
+        elif output == "human":
+            console.print(f"[red]{escape(message)}[/red]")
+        raise typer.Exit(exit_code)
+
+    def warn(message: str) -> None:
+        if output == "json":
+            print(json_mod.dumps({"event": "warning", "message": message}))
+        elif output == "human":
+            console.print(f"[yellow]{escape(message)}[/yellow]")
+
     if debug:
         logging.basicConfig(level=logging.DEBUG)
     else:
@@ -86,22 +106,20 @@ async def run_install(request: InstallRequest) -> None:
         try:
             mode = recovery_mode(chip)
         except ValueError as exc:
-            console.print(f"[red]{exc}[/red]")
-            raise typer.Exit(1) from exc
+            fail(str(exc))
         if mode == "usb":
-            console.print(
-                f"[red]{chip} recovers over USB, and `install` does not support "
-                "that yet — use `defib burn` to bring the board up.[/red]"
+            fail(
+                f"{chip} recovers over USB, and `install` does not support "
+                "that yet — use `defib burn` to bring the board up."
             )
-            raise typer.Exit(1)
 
     if has_stock_uboot and not nand and not wipe_env:
-        console.print(
-            "[red]Stock U-Boot migration requires --wipe-env so the newly "
+        fail(
+            "Stock U-Boot migration requires --wipe-env so the newly "
             "flashed OpenIPC U-Boot can start from its compiled defaults. "
-            "Defib preserves and restores the captured factory ethaddr.[/red]"
+            "Defib preserves and restores the captured factory ethaddr.",
+            exit_code=2,
         )
-        raise typer.Exit(2)
 
     # The NOR boot and env partitions are fixed across the standard OpenIPC
     # 8/16/32 MiB layouts. Kernel/rootfs sizing is selected after ``sf probe``
@@ -135,8 +153,7 @@ async def run_install(request: InstallRequest) -> None:
     try:
         firmware = load_firmware_bundle(firmware_path)
     except ValueError as exc:
-        console.print(f"[red]{exc}[/red]")
-        raise typer.Exit(1) from exc
+        fail(str(exc))
 
     kernel_name = firmware.kernel_name
     kernel_data = firmware.kernel
@@ -162,14 +179,12 @@ async def run_install(request: InstallRequest) -> None:
     if uboot_path:
         source_path = Path(uboot_path)
         if not source_path.exists():
-            console.print(f"[red]U-Boot override not found: {source_path}[/red]")
-            raise typer.Exit(1)
+            fail(f"U-Boot override not found: {source_path}")
         uboot_raw = source_path.read_bytes()
         uboot_source_name = source_path.name
     else:
         if not has_firmware(chip):
-            console.print(f"[red]No OpenIPC U-Boot for '{chip}'[/red]")
-            raise typer.Exit(1)
+            fail(f"No OpenIPC U-Boot for '{chip}'")
         cached = get_cached_path(chip)
         if cached is None:
             if output == "human":
@@ -179,15 +194,12 @@ async def run_install(request: InstallRequest) -> None:
         uboot_source_name = cached.name
 
     # Install writes a fixed boot partition. Release/override payloads may be
-    # shorter, so preserve the existing installer contract by padding the tail
-    # with erased flash bytes before chainload and flashing.
+    # shorter, so pad only the flash image tail with erased bytes. Vendor
+    # bootstraps chainload the original raw U-Boot payload.
     try:
         uboot_data = pad_to_size(uboot_raw, b_sz)
     except ValueError as exc:
-        console.print(
-            f"[red]U-Boot artifact does not fit the boot partition:[/red] {exc}"
-        )
-        raise typer.Exit(1) from exc
+        fail(f"U-Boot artifact does not fit the boot partition: {exc}")
 
     # Vendor migrations erase the environment only after all firmware partitions
     # have been written and verified. Generic installs retain their historical
@@ -317,8 +329,6 @@ async def run_install(request: InstallRequest) -> None:
                 await power_controller.close()
                 raise typer.Exit(1)
 
-        from defib.vendors.registry import create_uboot_bootstrap
-
         bootstrap_progress = None
         bootstrap_task = None
         bootstrap_progress_started = False
@@ -339,7 +349,7 @@ async def run_install(request: InstallRequest) -> None:
                 TimeElapsedColumn(),
                 console=console,
             )
-            bootstrap_task = bootstrap_progress.add_task("bootstrap", total=len(uboot_data))
+            bootstrap_task = bootstrap_progress.add_task("bootstrap", total=len(uboot_raw))
 
         def _bootstrap_progress(event: ProgressEvent) -> None:
             nonlocal bootstrap_progress_started
@@ -369,15 +379,14 @@ async def run_install(request: InstallRequest) -> None:
         try:
             bootstrap_result = await bootstrap.bootstrap(
                 transport,
-                uboot_data,
+                uboot_raw,
                 filename=Path(uboot_source_name).name,
             )
-        except TimeoutError as exc:
-            console.print(f"[red]U-Boot detection failed:[/red] {exc}")
+        except (TimeoutError, TransportError) as exc:
             await transport.close()
             if power_controller:
                 await power_controller.close()
-            raise typer.Exit(1)
+            fail(f"U-Boot bootstrap failed: {exc}")
         finally:
             if bootstrap_progress is not None and bootstrap_progress_started:
                 bootstrap_progress.stop()
@@ -416,6 +425,21 @@ async def run_install(request: InstallRequest) -> None:
     if output == "human":
         console.print(f"  [green]U-Boot loaded in {result.elapsed_ms:.0f}ms[/green]")
 
+    resources_closed = False
+
+    async def close_resources() -> None:
+        nonlocal resources_closed
+        if resources_closed:
+            return
+        resources_closed = True
+        await transport.close()
+        if power_controller:
+            await power_controller.close()
+
+    async def close_and_fail(message: str, exit_code: int = 1) -> NoReturn:
+        await close_resources()
+        fail(message, exit_code)
+
     # --- Step 3.5: Detect U-Boot mode (download_process or shell) ---
     # Must happen here (not in session.run) to detect download_process mode.
     import asyncio as _aio
@@ -447,6 +471,39 @@ async def run_install(request: InstallRequest) -> None:
         except TransportTimeout:
             pass
 
+    async def _wait_for_openipc_shell_after_reset(timeout: float = 20.0) -> None:
+        """Interrupt the freshly flashed U-Boot and wait for its shell."""
+        reset_buf = bytearray()
+        start_reset = _time_mod.monotonic()
+        while _time_mod.monotonic() - start_reset < timeout:
+            await transport.write(b"\x03")
+            try:
+                chunk = await transport.read(256, timeout=0.2)
+            except TransportTimeout:
+                await _aio.sleep(0.05)
+                continue
+            if not chunk:
+                await _aio.sleep(0.05)
+                continue
+            reset_buf.extend(chunk)
+            text = reset_buf.decode("ascii", errors="replace")
+            tail = text[-512:] if len(text) > 512 else text
+            if "autoboot" in tail.lower():
+                for _ in range(20):
+                    await transport.write(b"\x03")
+                    await _aio.sleep(0.05)
+            if "OpenIPC #" in tail or "hisilicon #" in tail or "\n=> " in tail:
+                return
+        raise RuntimeError(
+            "freshly flashed OpenIPC U-Boot prompt not detected after env reset"
+        )
+
+    if has_stock_uboot and download_mode:
+        await close_and_fail(
+            "Stock U-Boot migration requires a normal OpenIPC U-Boot shell after "
+            "chainload; download_process mode is not supported for this path."
+        )
+
     if download_mode:
         if output == "human":
             console.print("  [cyan]Download command mode detected[/cyan]")
@@ -454,7 +511,10 @@ async def run_install(request: InstallRequest) -> None:
         dl_client = DownloadCommandClient(transport)
 
         async def _cmd(cmd: str, timeout: float = 60.0, **kw: object) -> str:
-            ok, out = await dl_client.send_command(cmd, timeout=timeout)
+            try:
+                ok, out = await dl_client.send_command(cmd, timeout=timeout)
+            except TransportError as exc:
+                await close_and_fail(f"U-Boot transport failed while running {cmd!r}: {exc}")
             if not ok and output == "human":
                 console.print(f"  [yellow]Warning: {cmd} → ERROR[/yellow]")
             return out
@@ -467,51 +527,35 @@ async def run_install(request: InstallRequest) -> None:
             # a line is being entered.  For those boards, require U-Boot to echo
             # every character before Enter is sent.
             for attempt in range(2):
-                out = await send_command(
-                    transport,
-                    cmd,
-                    timeout=timeout,
-                    wait_for="# ",
-                    verify_echo=verify_shell_echo,
-                )
+                try:
+                    out = await send_command(
+                        transport,
+                        cmd,
+                        timeout=timeout,
+                        wait_for="# ",
+                        verify_echo=verify_shell_echo,
+                    )
+                except TransportError as exc:
+                    await close_and_fail(
+                        f"U-Boot transport failed while running {cmd!r}: {exc}"
+                    )
                 if "unknown command" not in out.lower() or attempt == 1:
                     return out
                 await transport.write(b"\x03\r")
                 await _aio.sleep(0.05)
             return out
 
-        async def _wait_for_openipc_shell_after_reset(timeout: float = 20.0) -> None:
-            """Interrupt the freshly flashed U-Boot and wait for its shell."""
-            reset_buf = bytearray()
-            start_reset = _time_mod.monotonic()
-            while _time_mod.monotonic() - start_reset < timeout:
-                await transport.write(b"\x03")
-                try:
-                    chunk = await transport.read(256, timeout=0.2)
-                except TransportTimeout:
-                    await _aio.sleep(0.05)
-                    continue
-                if not chunk:
-                    await _aio.sleep(0.05)
-                    continue
-                reset_buf.extend(chunk)
-                text = reset_buf.decode("ascii", errors="replace")
-                tail = text[-512:] if len(text) > 512 else text
-                if "autoboot" in tail.lower():
-                    for _ in range(20):
-                        await transport.write(b"\x03")
-                        await _aio.sleep(0.05)
-                if "OpenIPC #" in tail or "hisilicon #" in tail or "\n=> " in tail:
-                    return
-            raise RuntimeError(
-                "freshly flashed OpenIPC U-Boot prompt not detected after env reset"
-            )
+    async def _set_env_verified_or_fail(key: str, value: str) -> None:
+        try:
+            await set_uboot_env_verified(_cmd, key, value)
+        except RuntimeError as exc:
+            await close_and_fail(str(exc))
 
     if preserved_stock_env:
         if output == "human":
             console.print("  Applying preserved stock environment...")
         for key, value in preserved_stock_env.items():
-            await _cmd(f"setenv {key} {value}", timeout=3.0)
+            await _set_env_verified_or_fail(key, value)
 
     # Some vendor migrations need transient U-Boot settings so the chainloaded
     # OpenIPC U-Boot can perform the install itself (for example a non-default
@@ -521,7 +565,7 @@ async def run_install(request: InstallRequest) -> None:
         if output == "human":
             console.print("  Applying transient installer environment...")
         for key, value in stock_target.transient_env:
-            await set_uboot_env_verified(_cmd, key, value)
+            await _set_env_verified_or_fail(key, value)
 
     # --- Step 4: U-Boot console — probe flash ---
     if output == "human":
@@ -534,64 +578,43 @@ async def run_install(request: InstallRequest) -> None:
     if nand:
         resp = await _cmd("nand info", timeout=5.0)
         if "error" in resp.lower() or "no nand" in resp.lower():
-            console.print(f"[red]NAND detection failed:[/red] {resp.strip()}")
-            await transport.close()
-            raise typer.Exit(1)
+            await close_and_fail(f"NAND detection failed: {resp.strip()}")
         if output == "human":
             console.print("  [green]NAND flash detected[/green]")
     else:
         resp = await _cmd("sf probe 0", timeout=5.0)
         if "error" in resp.lower() or "fail" in resp.lower():
-            console.print(f"[red]sf probe failed:[/red] {resp.strip()}")
-            await transport.close()
-            raise typer.Exit(1)
+            await close_and_fail(f"sf probe failed: {resp.strip()}")
         block_match = re_mod.search(r"Block:\s*(\d+)\s*KB", resp, re_mod.IGNORECASE)
         if block_match:
             nor_erase_block = int(block_match.group(1)) * 1024
 
         detected_nor_size = detect_nor_size_mb(resp)
         if nor_size and detected_nor_size and nor_size != detected_nor_size:
-            console.print(
-                f"[red]--nor-size {nor_size} conflicts with detected "
-                f"{detected_nor_size} MiB NOR.[/red]"
+            warn(
+                f"--nor-size {nor_size} overrides detected "
+                f"{detected_nor_size} MiB NOR; using the explicit override."
             )
-            await transport.close()
-            raise typer.Exit(2)
-        if not nor_size:
-            if detected_nor_size is not None:
-                nor_size = detected_nor_size
-            elif has_stock_uboot:
-                console.print(
-                    "[red]Could not detect NOR capacity from U-Boot; "
-                    "specify --nor-size explicitly.[/red]"
-                )
-                await transport.close()
-                raise typer.Exit(2)
-            else:
-                # Preserve the historic fallback for generic boot-ROM installs.
-                nor_size = 8
+        try:
+            nor_size, nor_source = select_nor_size_mb(
+                nor_size,
+                detected_nor_size,
+                require_detection=has_stock_uboot,
+            )
+        except ValueError as exc:
+            await close_and_fail(str(exc), exit_code=2)
         layout = nor_layout(nor_size)
 
         k_off, k_sz = layout["kernel"]
         r_off, r_sz = layout["rootfs"]
         if len(kernel_data) > k_sz:
-            console.print(f"[red]Kernel too large: {len(kernel_data)} > {k_sz}[/red]")
-            await transport.close()
-            raise typer.Exit(1)
+            await close_and_fail(f"Kernel too large: {len(kernel_data)} > {k_sz}")
         if len(rootfs_data) > r_sz:
-            console.print(f"[red]Rootfs too large: {len(rootfs_data)} > {r_sz}[/red]")
-            await transport.close()
-            raise typer.Exit(1)
+            await close_and_fail(f"Rootfs too large: {len(rootfs_data)} > {r_sz}")
 
         if output == "human":
-            if detected_nor_size is not None:
-                source = "detected"
-            elif request.nor_size:
-                source = "override"
-            else:
-                source = "fallback"
             console.print(
-                f"  [green]SPI flash detected[/green]: {nor_size} MiB ({source}), "
+                f"  [green]SPI flash detected[/green]: {nor_size} MiB ({nor_source}), "
                 f"erase block 0x{nor_erase_block:X}"
             )
 
@@ -615,12 +638,10 @@ async def run_install(request: InstallRequest) -> None:
         or (tftp_via == "auto" and isinstance(power_controller, RackController))
     )
     if tftp_via == "pod" and not isinstance(power_controller, RackController):
-        console.print(
-            "[red]--tftp-via pod requires DEFIB_POWER_TYPE=rack[/red] "
+        await close_and_fail(
+            "--tftp-via pod requires DEFIB_POWER_TYPE=rack "
             "(no rack pod to host TFTP)."
         )
-        await transport.close()
-        raise typer.Exit(1)
 
     # Keep TFTP command lines short on old UART consoles.  ``loadaddr`` is
     # verified separately, so one-character aliases are sufficient here.
@@ -658,14 +679,16 @@ async def run_install(request: InstallRequest) -> None:
             if interfaces:
                 nic = interfaces[0]
             else:
-                console.print("[red]No network interfaces found. Specify --nic.[/red]")
-                await transport.close()
-                raise typer.Exit(1)
+                await close_and_fail("No network interfaces found. Specify --nic.")
         if output == "human":
             console.print(f"  NIC: [cyan]{nic}[/cyan], Host IP: [cyan]{host_ip}[/cyan]")
 
     from contextlib import AsyncExitStack
     async with AsyncExitStack() as stack:
+        # From this point onward every exit path closes the UART and power
+        # controller, including validation/echo failures raised mid-install.
+        stack.push_async_callback(close_resources)
+
         # Set up the TFTP backend.  Both branches end up with:
         #   serverip          — U-Boot's `setenv serverip` value
         #   replace_in_tftp() — async hook to swap a file mid-flow
@@ -723,26 +746,41 @@ async def run_install(request: InstallRequest) -> None:
         # ── U-Boot console drive (identical for both backends, only
         #    `serverip` and `replace_in_tftp` differ) ─────────────────
         try:
-            # Configure transient U-Boot networking for this installer run.
-            # Persistent OpenIPC defaults (for example serverip=192.168.1.254)
-            # must never leak into the active TFTP session.  Verify both values
-            # from the live shell before issuing tftpboot.
-            await set_uboot_env_verified(_cmd, "ipaddr", device_ip)
-            await set_uboot_env_verified(_cmd, "serverip", serverip)
-            await set_uboot_env_verified(_cmd, "loadaddr", f"0x{ram_addr:x}")
+            # Vendor-U-Boot migration uses short TFTP command lines because the
+            # legacy UART is fragile; verify loadaddr before relying on it.  The
+            # generic boot-ROM/download-mode path keeps the historical explicit
+            # tftpboot address so it does not depend on printenv formatting.
+            if has_stock_uboot:
+                await set_uboot_env_verified(_cmd, "ipaddr", device_ip)
+                await set_uboot_env_verified(_cmd, "serverip", serverip)
+                await set_uboot_env_verified(_cmd, "loadaddr", f"0x{ram_addr:x}")
+            else:
+                await _cmd(f"setenv ipaddr {device_ip}", timeout=3.0)
+                await _cmd(f"setenv serverip {serverip}", timeout=3.0)
 
             if output == "human":
-                console.print(
-                    f"  Runtime network verified: device=[cyan]{device_ip}[/cyan], "
-                    f"server=[cyan]{serverip}[/cyan], "
-                    f"loadaddr=[cyan]0x{ram_addr:x}[/cyan]"
-                )
+                if has_stock_uboot:
+                    console.print(
+                        f"  Runtime network verified: device=[cyan]{device_ip}[/cyan], "
+                        f"server=[cyan]{serverip}[/cyan], "
+                        f"loadaddr=[cyan]0x{ram_addr:x}[/cyan]"
+                    )
+                else:
+                    console.print(
+                        f"  Device IP: [cyan]{device_ip}[/cyan], "
+                        f"server: [cyan]{serverip}[/cyan]"
+                    )
 
             async def _tftp_to_ram(filename: str, timeout: float = 120.0) -> str:
-                """TFTP download using a short filename and verified loadaddr."""
-                resp = await _cmd(f"tftpboot {filename}", timeout=timeout)
+                """TFTP download, preserving the generic explicit-address path."""
+                tftpboot_cmd, tftp_cmd = uboot_tftp_commands(
+                    filename,
+                    ram_addr,
+                    use_loadaddr=has_stock_uboot,
+                )
+                resp = await _cmd(tftpboot_cmd, timeout=timeout)
                 if "unknown command" in resp.lower():
-                    resp = await _cmd(f"tftp {filename}", timeout=timeout)
+                    resp = await _cmd(tftp_cmd, timeout=timeout)
                 if "done" not in resp.lower() and "bytes transferred" not in resp.lower():
                     raise RuntimeError(f"TFTP download failed: {resp.strip()[-200:]}")
                 return resp
@@ -960,10 +998,9 @@ async def run_install(request: InstallRequest) -> None:
                     raise RuntimeError(
                         f"rootfs_data erase verify failed ({verify_error})"
                     )
-                match = re_mod.search(r"==>\s*([0-9a-fA-F]{8})", verify_resp)
-                if not match:
+                actual_crc = parse_uboot_crc32(verify_resp)
+                if actual_crc is None:
                     raise RuntimeError("could not parse rootfs_data erased-region CRC")
-                actual_crc = int(match.group(1), 16)
                 expected_crc = erased_region_crc(data_size)
                 if actual_crc != expected_crc:
                     raise RuntimeError(
@@ -984,8 +1021,6 @@ async def run_install(request: InstallRequest) -> None:
             # After that Defib re-applies only install invariants plus instance
             # identity; device policy remains the firmware/profile's responsibility.
             if has_stock_uboot and not nand:
-                from defib.uboot_env import parse_printenv_value, select_install_ethaddr
-
                 pre_reset_eth_resp = await _cmd("printenv ethaddr", timeout=5.0)
                 pre_reset_eth = parse_printenv_value(pre_reset_eth_resp, "ethaddr")
                 preserved_eth = preserved_stock_env.get("ethaddr")
@@ -1030,14 +1065,11 @@ async def run_install(request: InstallRequest) -> None:
                     raise RuntimeError(
                         f"U-Boot environment erase verify failed ({env_verify_error})"
                     )
-                env_crc_match = re_mod.search(
-                    r"==>\s*([0-9a-fA-F]{8})", env_verify_resp
-                )
-                if not env_crc_match:
+                env_crc = parse_uboot_crc32(env_verify_resp)
+                if env_crc is None:
                     raise RuntimeError(
                         "could not parse U-Boot environment erased-region CRC"
                     )
-                env_crc = int(env_crc_match.group(1), 16)
                 expected_env_crc = erased_region_crc(env_size)
                 if env_crc != expected_env_crc:
                     raise RuntimeError(
@@ -1084,8 +1116,6 @@ async def run_install(request: InstallRequest) -> None:
 
             # Preserve a factory MAC captured from stock U-Boot. For normal
             # boot-ROM installs keep the existing generic rescue-MAC behavior.
-            from defib.uboot_env import parse_printenv_value, select_install_ethaddr
-
             eth_resp = await _cmd("printenv ethaddr", timeout=5.0)
             current_eth = parse_printenv_value(eth_resp, "ethaddr")
             preserved_eth = preserved_stock_env.get("ethaddr")
@@ -1112,7 +1142,10 @@ async def run_install(request: InstallRequest) -> None:
                             f"  ethaddr unavailable — assigning rescue MAC "
                             f"[cyan]{selected_eth}[/cyan]"
                         )
-                await _cmd(f"setenv ethaddr {selected_eth}", timeout=3.0)
+                if has_stock_uboot:
+                    await set_uboot_env_verified(_cmd, "ethaddr", selected_eth)
+                else:
+                    await _cmd(f"setenv ethaddr {selected_eth}", timeout=3.0)
             elif output == "human":
                 label = "factory" if eth_source == "preserved" else "current"
                 console.print(
@@ -1124,7 +1157,13 @@ async def run_install(request: InstallRequest) -> None:
                 raise RuntimeError(f"saveenv failed: {save_resp.strip()}")
 
             if has_stock_uboot:
-                from defib.uboot_env import parse_printenv_value
+                env_off, env_size = nor_layout(nor_size)["env"]
+                persisted_crc = await verify_spi_environment_crc(
+                    _cmd,
+                    env_off=env_off,
+                    env_size=env_size,
+                    ram_addr=ram_addr,
+                )
 
                 verify_resp = await _cmd("printenv ethaddr", timeout=5.0)
                 saved_eth = parse_printenv_value(verify_resp, "ethaddr")
@@ -1143,7 +1182,10 @@ async def run_install(request: InstallRequest) -> None:
                         f"expected={expected_mtdparts!r} got={saved_mtdparts!r}"
                     )
                 if output == "human":
-                    console.print("  [green]Environment saved and verified[/green]")
+                    console.print(
+                        "  [green]Environment saved and verified "
+                        f"(SPI CRC {persisted_crc:08X})[/green]"
+                    )
             elif output == "human":
                 console.print("  [green]Environment saved[/green]")
 
@@ -1156,14 +1198,10 @@ async def run_install(request: InstallRequest) -> None:
                     "\n  [yellow]Final reset skipped; device left at U-Boot prompt.[/yellow]"
                 )
 
-        except Exception:  # noqa: TRY203 - preserve explicit install scope for cleanup
-            raise
+        except (RuntimeError, TransportError) as exc:
+            fail(str(exc))
         # The AsyncExitStack handles closing the host TFTP transport and
-        # clearing pod TFTP state — no per-branch finally needed here.
-
-    await transport.close()
-    if power_controller:
-        await power_controller.close()
+        # clearing pod TFTP state plus UART/power resources.
 
     if output == "human":
         if final_reset:

@@ -1,7 +1,8 @@
 """Tests for the CLI interface."""
 
 import re
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 
 from typer.testing import CliRunner
 
@@ -31,6 +32,39 @@ class TestListChips:
         assert "count" in data
         assert data["count"] > 50
         assert "hi3516cv300" in data["chips"]
+        assert "hi3518ev100:hiwatch-ds-i203" in data["chips"]
+
+    def test_list_chips_human_includes_registered_stock_uboot_variant(self):
+        result = runner.invoke(app, ["list-chips"])
+        assert result.exit_code == 0
+        assert "hi3518ev100:hiwatch-ds-i203" in _strip_ansi(result.stdout)
+
+
+class TestInstallErrors:
+    def test_invalid_chip_json_error_is_machine_readable(self, monkeypatch):
+        import json
+
+        serial_platform = ModuleType("defib.transport.serial_platform")
+        serial_platform.create_transport = None
+        serial_platform.normalize_port_name = lambda port: port
+        monkeypatch.setitem(sys.modules, "defib.transport.serial_platform", serial_platform)
+
+        result = runner.invoke(
+            app,
+            [
+                "install",
+                "-c",
+                "hi3516cv300:not-a-board",
+                "--firmware",
+                "missing.tgz",
+                "--output",
+                "json",
+            ],
+        )
+        assert result.exit_code == 1
+        payload = json.loads(result.stdout)
+        assert payload["event"] == "error"
+        assert "not-a-board" in payload["message"]
 
 
 class TestBurnHelp:

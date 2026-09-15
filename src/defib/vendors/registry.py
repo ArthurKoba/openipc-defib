@@ -53,14 +53,9 @@ def get_stock_uboot_target(selector: str) -> StockUBootTarget | None:
     return _STOCK_UBOOT_TARGETS.get(selector.lower())
 
 
-def list_stock_uboot_variants(soc: str) -> list[str]:
-    """List vendor-U-Boot migration variants registered for one SoC."""
-    prefix = f"{soc.lower()}:"
-    return sorted(
-        target.selector.split(":", 1)[1]
-        for key, target in _STOCK_UBOOT_TARGETS.items()
-        if key.startswith(prefix)
-    )
+def list_stock_uboot_selectors() -> list[str]:
+    """List exact ``soc:variant`` selectors registered for vendor migration."""
+    return sorted(target.selector for target in _STOCK_UBOOT_TARGETS.values())
 
 
 def create_uboot_bootstrap(

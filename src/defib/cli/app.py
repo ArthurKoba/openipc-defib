@@ -459,8 +459,10 @@ def list_chips_cmd(
     from rich.columns import Columns
 
     from defib.profiles.loader import list_all_chips
+    from defib.vendors.registry import list_stock_uboot_selectors
 
-    chips = list_all_chips()
+    base_chips = list_all_chips()
+    chips = sorted({*base_chips, *list_stock_uboot_selectors()})
 
     if output == "json":
         print(json_mod.dumps({"chips": chips, "count": len(chips)}))

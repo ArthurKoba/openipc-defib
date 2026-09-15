@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 import zlib
 from collections.abc import Awaitable, Callable
@@ -10,6 +11,7 @@ from collections.abc import Awaitable, Callable
 from defib.uboot_env import parse_printenv_value
 
 Command = Callable[..., Awaitable[str]]
+logger = logging.getLogger(__name__)
 
 
 NOR8M_LAYOUT = {
@@ -63,21 +65,39 @@ def erased_region_crc(size: int) -> int:
 
 
 def uboot_flash_command_error(response: str) -> str | None:
-    text = response.lower()
-    markers = (
-        "error:",
-        " failed",
-        "failed",
-        "failure",
-        "out of range",
-        "not block aligned",
-        "unknown command",
-        "usage: sf ",
-        "usage: nand ",
+    """Return a flash-command failure marker from command result lines.
+
+    U-Boot responses can include command echo and unrelated banner text.  Do
+    not treat an arbitrary ``failed`` substring anywhere in that buffer as the
+    result of the destructive command that just ran.
+    """
+    result_prefixes = (
+        "sf:",
+        "spi flash",
+        "spi nor",
+        "nand",
+        "erase",
+        "erasing",
+        "write",
+        "writing",
+        "read",
+        "reading",
     )
-    for marker in markers:
-        if marker in text:
-            return marker.strip()
+    for raw_line in response.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        text = line.lower()
+        if text.startswith(("error:", "unknown command", "usage: sf", "usage: nand")):
+            return line
+        if "no spi flash selected" in text:
+            return line
+        if "out of range" in text or "not block aligned" in text:
+            return line
+        if text in {"failed", "failure"}:
+            return line
+        if text.startswith(result_prefixes) and re.search(r"\b(?:failed|failure)\b", text):
+            return line
     return None
 
 
@@ -127,14 +147,6 @@ def nor_mtdparts(nor_size: int) -> str:
     )
 
 
-def nor_bootargs() -> str:
-    return (
-        "mem=${osmem} console=ttyAMA0,115200 panic=20 "
-        "root=/dev/mtdblock3 rootfstype=squashfs init=/init "
-        "mtdparts=${mtdparts} ${extras}"
-    )
-
-
 def nand_bootargs(rootfs_is_ubi: bool) -> str:
     base = (
         "mem=256M console=ttyAMA0,115200 panic=20 ubi.mtd=3,2048 "
@@ -152,6 +164,72 @@ def parse_uboot_crc32(response: str) -> int | None:
     """Return the CRC printed by U-Boot, or ``None`` if it is missing."""
     match = re.search(r"==>\s*([0-9a-fA-F]{8})", response)
     return int(match.group(1), 16) if match else None
+
+
+async def verify_spi_environment_crc(
+    cmd: Command,
+    *,
+    env_off: int,
+    env_size: int,
+    ram_addr: int,
+) -> int:
+    """Read the saved SPI environment back and validate its on-flash CRC.
+
+    OpenIPC's non-redundant SPI environment is ``uint32_t crc`` followed by
+    ``CONFIG_ENV_SIZE - 4`` data bytes.  U-Boot stores both the header CRC and
+    the value produced by the ``crc32 ... <storeaddr>`` command in native word
+    order, so ``cmp.l`` validates them without host-endianness assumptions.
+    """
+    if env_size <= 4:
+        raise ValueError("environment partition is too small for a CRC header")
+
+    # ``reset`` clears U-Boot's in-memory SPI selection state.  Environment
+    # installation deliberately performs an internal reset after erasing the
+    # old environment, so always re-probe immediately before physical
+    # readback instead of relying on an earlier installer-stage probe.
+    probe_response = await cmd("sf probe 0", timeout=10.0)
+    logger.debug("SPI env probe response: %r", probe_response)
+    probe_error = uboot_flash_command_error(probe_response)
+    if probe_error:
+        raise RuntimeError(f"environment SPI probe failed: {probe_error}")
+
+    read_response = await cmd(
+        f"sf read 0x{ram_addr:x} 0x{env_off:x} 0x{env_size:x}",
+        timeout=30.0,
+    )
+    logger.debug("SPI env readback response: %r", read_response)
+    read_error = uboot_flash_command_error(read_response)
+    if read_error:
+        raise RuntimeError(f"environment readback failed: {read_error}")
+
+    crc_store_addr = ram_addr + env_size
+    crc_response = await cmd(
+        f"crc32 0x{ram_addr + 4:x} 0x{env_size - 4:x} 0x{crc_store_addr:x}",
+        timeout=10.0,
+    )
+    logger.debug("SPI env data CRC response: %r", crc_response)
+    data_crc = parse_uboot_crc32(crc_response)
+    if data_crc is None:
+        raise RuntimeError("could not parse persisted environment data CRC")
+
+    compare_response = await cmd(
+        f"cmp.l 0x{ram_addr:x} 0x{crc_store_addr:x} 1",
+        timeout=5.0,
+    )
+    logger.debug("SPI env CRC compare response: %r", compare_response)
+    compare_error = uboot_flash_command_error(compare_response)
+    if compare_error:
+        raise RuntimeError(f"environment CRC compare failed: {compare_error}")
+    if not re.search(
+        r"\bTotal of\s+1\s+word(?:\(s\)|s)?\s+were the same\b",
+        compare_response,
+        re.IGNORECASE,
+    ):
+        raise RuntimeError(
+            "persisted U-Boot environment failed its on-flash CRC check; "
+            f"cmp response={compare_response.strip()[-240:]!r}"
+        )
+    return data_crc
 
 
 def detect_nor_size_mb(response: str) -> int | None:
@@ -173,6 +251,24 @@ def detect_nor_size_mb(response: str) -> int | None:
             if value % divisor == 0:
                 return value // divisor
     return None
+
+
+def select_nor_size_mb(
+    override: int,
+    detected: int | None,
+    *,
+    require_detection: bool,
+) -> tuple[int, str]:
+    """Choose NOR capacity while preserving ``--nor-size`` as an override."""
+    if override:
+        return override, "override"
+    if detected is not None:
+        return detected, "detected"
+    if require_detection:
+        raise ValueError(
+            "could not detect NOR capacity from U-Boot; specify --nor-size explicitly"
+        )
+    return 8, "fallback"
 
 
 def nor_layout(nor_size_mb: int) -> dict[str, tuple[int, int]]:

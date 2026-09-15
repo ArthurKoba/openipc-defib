@@ -133,15 +133,24 @@ Backends: `spi_flash.c` (fmc100), `spi_flash_hisfc350.c` (V1-era parts),
 ### Other key modules
 
 - **Profiles** (`src/defib/profiles/`) — 112 JSON SoC definitions in `data/`,
-  validated with Pydantic (`schema.py`). `defib list-chips` shows 123: those 112
-  plus the 11 hardcoded V500/CV6xx chips that have no profile file.
+  validated with Pydantic (`schema.py`). `defib list-chips` combines those
+  profiles with hardcoded V500/CV6xx chips and exact registered vendor-U-Boot
+  migration selectors.
   `hi3516av300.json` additionally declares a board `variant`, selected as
   `hi3516av300:emmc`. A profile file whose entire contents are another filename
   is an **alias** (`hi3516ev300.json` is just `hi3516ev200.json`).
-- **CLI** (`src/defib/cli/`) — Typer app, one large `app.py`. Commands: `burn`,
-  `install`, `restore`, `dump-flash`, `detect`, `capture`, `replay`, `network`,
-  `ports`, `list-chips`, `list-interfaces`, `tui`, plus the `agent` sub-app
-  (`upload`, `flash`, `info`, `read`, `write`, `scan`, `membw`).
+- **CLI** (`src/defib/cli/`) — Typer entry points live in `app.py`; substantial
+  command implementations may live in dedicated modules. `install` is
+  orchestrated by `src/defib/install/`. Commands: `burn`, `install`, `restore`,
+  `dump-flash`, `detect`, `capture`, `replay`, `network`, `ports`, `list-chips`,
+  `list-interfaces`, `tui`, plus the `agent` sub-app (`upload`, `flash`, `info`,
+  `read`, `write`, `scan`, `membw`).
+- **Vendor U-Boot bootstrap** (`src/defib/vendors/`) — migration from an
+  already-running stock/vendor U-Boot into an OpenIPC U-Boot shell. This is a
+  later recovery stage than `BootProtocol`: targets use exact `soc:variant`
+  selectors in the vendor registry, then `install` continues through the common
+  flash path. Keep installer-transient environment here; persistent board policy
+  belongs to firmware/device profiles.
 - **Power** (`src/defib/power/`) — `routeros` (MikroTik PoE, default), `vectis`,
   `rack`, chosen by `DEFIB_POWER_TYPE`.
 - **TUI** (`src/defib/tui/`) — Textual UI, including the Flash Doctor screen.
@@ -163,6 +172,11 @@ Backends: `spi_flash.c` (fmc100), `spi_flash_hisfc350.c` (V1-era parts),
 Protocols are real plugins: subclass `BootProtocol`, add `@register`, and either
 ship in-tree or publish an entry point in the `defib.protocols` group —
 `registry.py` imports them on first use.
+
+Vendor U-Boot bootstraps are not boot-ROM protocols and do not register through
+`defib.protocols`. Add an implementation under `src/defib/vendors/` and an exact
+target selector in `vendors/registry.py`; `defib list-chips` exposes registered
+vendor-migration selectors alongside profile/protocol chip names.
 
 **Power controllers are not.** Despite the `[project.entry-points."defib.power"]`
 block in pyproject.toml, nothing reads that group;

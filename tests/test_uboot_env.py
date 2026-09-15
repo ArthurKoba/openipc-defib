@@ -5,10 +5,7 @@ import re
 from defib.uboot_env import (
     OPENIPC_DEFAULT_ETHADDR,
     generate_locally_administered_mac,
-    env_values_equivalent,
-    expand_env_references,
     is_unset_or_default_ethaddr,
-    parse_printenv,
     parse_printenv_value,
     select_install_ethaddr,
 )
@@ -108,54 +105,6 @@ def test_default_const_is_what_we_observed():
     # binaries (hi3516av200 + hi3516cv300). If OpenIPC ever changes the
     # baked-in default, this test breaks loudly so we know to update.
     assert OPENIPC_DEFAULT_ETHADDR == "00:00:23:34:45:66"
-
-
-def test_parse_full_printenv_preserves_shell_commands():
-    response = (
-        "OpenIPC # printenv\n"
-        "bootcmd=sf probe 0; sf read ${baseaddr} 0x70000 0x380000; bootm ${baseaddr}\n"
-        "bootargs=mem=128M console=ttyAMA0,115200 root=/dev/mtdblock5 rootfstype=squashfs ro\n"
-        "ethaddr=18:68:cb:6b:e6:64\n"
-        "Environment size: 1234/65532 bytes\n"
-        "OpenIPC # \n"
-    )
-    env = parse_printenv(response)
-    assert env["bootcmd"] == (
-        "sf probe 0; sf read ${baseaddr} 0x70000 0x380000; bootm ${baseaddr}"
-    )
-    assert env["ethaddr"] == "18:68:cb:6b:e6:64"
-    assert "mdio_intf" not in env
-
-
-def test_parse_full_printenv_ignores_non_assignments_and_keeps_first_equals_in_value():
-    response = "prompt\nfoo=a=b=c\n## Error: nope\nbar= baz qux \n"
-    assert parse_printenv(response) == {"foo": "a=b=c", "bar": "baz qux"}
-
-
-def test_expand_env_references_uses_captured_snapshot():
-    env = {"baseaddr": "0x82000000"}
-    assert expand_env_references(
-        "sf probe 0; sf read ${baseaddr} 0x70000 0x380000; bootm ${baseaddr}",
-        env,
-    ) == "sf probe 0; sf read 0x82000000 0x70000 0x380000; bootm 0x82000000"
-
-
-def test_env_values_equivalent_accepts_legacy_setenv_expansion():
-    env = {"baseaddr": "0x82000000"}
-    expected = "sf probe 0; sf read ${baseaddr} 0x70000 0x380000; bootm ${baseaddr}"
-    actual = "sf probe 0; sf read 0x82000000 0x70000 0x380000; bootm 0x82000000"
-    assert env_values_equivalent(expected, actual, env)
-
-
-def test_env_values_equivalent_rejects_wrong_expanded_address():
-    env = {"baseaddr": "0x82000000"}
-    expected = "bootm ${baseaddr}"
-    assert not env_values_equivalent(expected, "bootm 0x83000000", env)
-
-
-def test_env_values_equivalent_does_not_hide_missing_reference():
-    env = {}
-    assert not env_values_equivalent("bootm ${baseaddr}", "bootm 0x82000000", env)
 
 
 class TestSelectInstallEthaddr:

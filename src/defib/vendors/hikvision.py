@@ -7,6 +7,7 @@ import time
 from dataclasses import dataclass
 from enum import Enum
 
+from defib.flashdump import write_uboot_line_with_echo_verify
 from defib.recovery.events import ProgressEvent, RecoveryResult, Stage
 from defib.recovery.ymodem import YModemError, YModemSender
 from defib.transport.base import Transport, TransportTimeout
@@ -126,6 +127,12 @@ class HikvisionUBootBootstrap:
                     ),
                 )
             except TransportTimeout:
+                await asyncio.sleep(
+                    min(
+                        self.timing.openipc_poll_interval,
+                        max(0.0, deadline - loop.time()),
+                    )
+                )
                 continue
             if not chunk:
                 continue
@@ -185,6 +192,7 @@ class HikvisionUBootBootstrap:
             try:
                 chunk = await transport.read(256, timeout=self.timing.read_timeout)
             except TransportTimeout:
+                await asyncio.sleep(self.timing.openipc_poll_interval)
                 continue
             if not chunk:
                 continue
@@ -230,8 +238,7 @@ class HikvisionUBootBootstrap:
     async def _run_stock_command(
         self, transport: Transport, command: str, *, timeout: float | None = None
     ) -> str:
-        await transport.write(command.encode("ascii") + b"\r")
-        await transport.flush_output()
+        await write_uboot_line_with_echo_verify(transport, command)
         response = await self._read_until(
             transport,
             (self._STOCK_PROMPT,),
@@ -250,8 +257,12 @@ class HikvisionUBootBootstrap:
         address_text = f"0x{self.load_address:08x}"
         load_cmd = f"loady {address_text}"
         self._log(f"Hikvision U-Boot: {load_cmd}")
-        await transport.write(load_cmd.encode("ascii") + b"\r")
-        await transport.flush_output()
+        await write_uboot_line_with_echo_verify(transport, load_cmd)
+
+        # Drop the echoed command / loady banner before waiting for YMODEM's
+        # periodic CRC request.  Otherwise an unrelated uppercase 'C' in that
+        # text can be mistaken for the 0x43 protocol byte.
+        await transport.flush_input()
 
         sender = YModemSender(
             transport,
@@ -293,8 +304,7 @@ class HikvisionUBootBootstrap:
 
         start_cmd = f"go {address_text}"
         self._log(f"Hikvision U-Boot: {start_cmd}")
-        await transport.write(start_cmd.encode("ascii") + b"\r")
-        await transport.flush_output()
+        await write_uboot_line_with_echo_verify(transport, start_cmd)
 
         loop = asyncio.get_running_loop()
         deadline = loop.time() + self.timing.openipc_timeout

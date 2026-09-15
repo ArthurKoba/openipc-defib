@@ -352,6 +352,7 @@ class HikvisionUBootBootstrap:
                     elapsed_ms=0.0,
                     post_burn_buffer=capture,
                 ),
+                chainloaded=False,
             )
 
         preserved_env: dict[str, str] = {}
@@ -367,4 +368,8 @@ class HikvisionUBootBootstrap:
             )
 
         recovery = await self._chainload(transport, firmware, filename=filename)
-        return UBootBootstrapResult(recovery=recovery, preserved_env=preserved_env)
+        return UBootBootstrapResult(
+            recovery=recovery,
+            preserved_env=preserved_env,
+            chainloaded=True,
+        )

@@ -217,8 +217,18 @@ Safety properties already built in — do not re-derive or undo them:
 
 - `restore` writes the **boot partition last**, so an interrupted restore usually
   leaves a bootable bootloader (`cli/app.py`, "Write boot partition (offset 0) LAST").
-- The env partition is preserved unless `--wipe-env`; wiping it loses `ethaddr`
-  and the MAC falls back to OpenIPC's compiled-in `00:00:23:34:45:66`.
+- The env partition is preserved unless `--wipe-env` is active for an `env`
+  stage. Generic wipes can lose `ethaddr`; registered stock-U-Boot migrations
+  capture and restore the factory MAC instead of falling back to OpenIPC's
+  compiled-in `00:00:23:34:45:66`.
+- `install` defaults to the complete production stage plan. Development runs may
+  use repeated `--stage` for an exact subset or repeated `--skip-stage` to
+  subtract stages. The stage names are `uboot`, `kernel`, `rootfs`,
+  `rootfs-data`, `env`, and `reset`; the two selection modes are mutually
+  exclusive. Exact stage selection only resets when `reset` is explicitly
+  selected. Registered stock-U-Boot migrations reject persistent partial writes
+  that omit `uboot` when the current session actually had to chainload from the
+  factory bootloader.
 - `agent flash` skips all-`0xFF` sectors and verifies CRC32 (`--no-verify` opts out).
 - `FlashPartition` carries `sectors` as well as `lba` specifically so an oversized
   image cannot be written through into the next partition.

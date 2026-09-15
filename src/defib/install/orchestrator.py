@@ -29,7 +29,7 @@ from defib.install.layout import (
     uboot_flash_command_error,
     verify_spi_environment_crc,
 )
-from defib.install.model import InstallRequest
+from defib.install.model import InstallRequest, resolve_install_stages
 
 
 async def run_install(request: InstallRequest) -> None:
@@ -79,6 +79,19 @@ async def run_install(request: InstallRequest) -> None:
     output = request.output
     debug = request.debug
 
+    stage_error: str | None = None
+    try:
+        stages = resolve_install_stages(
+            request.stages,
+            request.skip_stages,
+            final_reset=final_reset,
+        )
+    except ValueError as exc:
+        # ``fail`` is defined below; defer emission until the common CLI-safe
+        # error helper is available.
+        stage_error = str(exc)
+        stages = ()
+
     def fail(message: str, exit_code: int = 1) -> NoReturn:
         """Emit one CLI-safe install error and stop."""
         if output == "json":
@@ -92,6 +105,12 @@ async def run_install(request: InstallRequest) -> None:
             print(json_mod.dumps({"event": "warning", "message": message}))
         elif output == "human":
             console.print(f"[yellow]{escape(message)}[/yellow]")
+
+    if stage_error is not None:
+        fail(stage_error, exit_code=2)
+
+    stage_set = set(stages)
+    needs_tftp = bool(stage_set & {"uboot", "kernel", "rootfs"})
 
     if debug:
         logging.basicConfig(level=logging.DEBUG)
@@ -113,10 +132,10 @@ async def run_install(request: InstallRequest) -> None:
                 "that yet — use `defib burn` to bring the board up."
             )
 
-    if has_stock_uboot and not nand and not wipe_env:
+    if has_stock_uboot and not nand and "env" in stage_set and not wipe_env:
         fail(
-            "Stock U-Boot migration requires --wipe-env so the newly "
-            "flashed OpenIPC U-Boot can start from its compiled defaults. "
+            "The env stage for a stock U-Boot migration requires --wipe-env so "
+            "the OpenIPC U-Boot can start from its compiled defaults. "
             "Defib preserves and restores the captured factory ethaddr.",
             exit_code=2,
         )
@@ -149,6 +168,8 @@ async def run_install(request: InstallRequest) -> None:
         console.print(f"  Profile: [cyan]{chip}[/cyan]")
         console.print(f"  Port:    [cyan]{port}[/cyan]")
         console.print(f"  Flash:   [cyan]{flash_label}[/cyan]")
+        if request.stages or request.skip_stages:
+            console.print(f"  Stages:  [cyan]{', '.join(stages)}[/cyan]")
 
     try:
         firmware = load_firmware_bundle(firmware_path)
@@ -204,7 +225,11 @@ async def run_install(request: InstallRequest) -> None:
     # Vendor migrations erase the environment only after all firmware partitions
     # have been written and verified. Generic installs retain their historical
     # --wipe-env behavior of erasing boot+env together.
-    uboot_flash_size = b_sz + env_sz if wipe_env and not has_stock_uboot else b_sz
+    uboot_flash_size = (
+        b_sz + env_sz
+        if wipe_env and "env" in stage_set and not has_stock_uboot
+        else b_sz
+    )
 
     if output == "human":
         if len(uboot_raw) == len(uboot_data):
@@ -312,6 +337,7 @@ async def run_install(request: InstallRequest) -> None:
             console.print(f"  {event.message}")
 
     verify_shell_echo = False
+    vendor_chainloaded = False
 
     if has_stock_uboot:
         assert transport is not None
@@ -392,6 +418,7 @@ async def run_install(request: InstallRequest) -> None:
                 bootstrap_progress.stop()
 
         preserved_stock_env.update(bootstrap_result.preserved_env)
+        vendor_chainloaded = bootstrap_result.chainloaded
         result = bootstrap_result.recovery
 
     elif use_rack_fastboot:
@@ -421,6 +448,24 @@ async def run_install(request: InstallRequest) -> None:
             await power_controller.close()
         raise typer.Exit(1)
     assert transport is not None  # success ⇒ transport opened
+
+    if vendor_chainloaded:
+        partial_persistent = stage_set & {"kernel", "rootfs", "rootfs-data", "env"}
+        if partial_persistent and "uboot" not in stage_set:
+            await transport.close()
+            if power_controller:
+                await power_controller.close()
+            fail(
+                "A partial persistent install was requested while the device still "
+                "boots genuine stock U-Boot. Include --stage uboot in this run, or "
+                "run the partial stage after OpenIPC U-Boot has been installed.",
+                exit_code=2,
+            )
+        if "uboot" in stage_set and "env" not in stage_set:
+            warn(
+                "U-Boot is being flashed without the env stage; the existing "
+                "persistent vendor environment will be left in place."
+            )
 
     if output == "human":
         console.print(f"  [green]U-Boot loaded in {result.elapsed_ms:.0f}ms[/green]")
@@ -561,7 +606,7 @@ async def run_install(request: InstallRequest) -> None:
     # OpenIPC U-Boot can perform the install itself (for example a non-default
     # PHY address needed for TFTP). These are deliberately not persistent board
     # policy: clearing the old persistent env before reboot discards them.
-    if stock_target is not None and stock_target.transient_env:
+    if needs_tftp and stock_target is not None and stock_target.transient_env:
         if output == "human":
             console.print("  Applying transient installer environment...")
         for key, value in stock_target.transient_env:
@@ -569,7 +614,8 @@ async def run_install(request: InstallRequest) -> None:
 
     # --- Step 4: U-Boot console — probe flash ---
     if output == "human":
-        console.print("\n[bold yellow]Phase 2: Flash via TFTP[/bold yellow]")
+        phase2 = "Flash via TFTP" if needs_tftp else "Selected install stages"
+        console.print(f"\n[bold yellow]Phase 2: {phase2}[/bold yellow]")
 
     ram_addr = get_ram_staging_addr(chip)
 
@@ -633,11 +679,15 @@ async def run_install(request: InstallRequest) -> None:
     #              `nic` at `host_ip`. Needs sudo / port-69 / NIC plumbing.
     #
     # `--tftp-via auto` picks pod when power=rack, host otherwise.
-    use_pod_tftp = (
+    use_pod_tftp = needs_tftp and (
         tftp_via == "pod"
         or (tftp_via == "auto" and isinstance(power_controller, RackController))
     )
-    if tftp_via == "pod" and not isinstance(power_controller, RackController):
+    if (
+        needs_tftp
+        and tftp_via == "pod"
+        and not isinstance(power_controller, RackController)
+    ):
         await close_and_fail(
             "--tftp-via pod requires DEFIB_POWER_TYPE=rack "
             "(no rack pod to host TFTP)."
@@ -646,18 +696,20 @@ async def run_install(request: InstallRequest) -> None:
     # Keep TFTP command lines short on old UART consoles.  ``loadaddr`` is
     # verified separately, so one-character aliases are sufficient here.
     tftp_alias = {"uboot": "u", "kernel": "k", "rootfs": "r"}
-    tftp_files = {
-        tftp_alias["uboot"]: uboot_data,
-        tftp_alias["kernel"]: kernel_data,
-        tftp_alias["rootfs"]: rootfs_data,
-    }
+    tftp_files: dict[str, bytes] = {}
+    if "uboot" in stage_set:
+        tftp_files[tftp_alias["uboot"]] = uboot_data
+    if "kernel" in stage_set:
+        tftp_files[tftp_alias["kernel"]] = kernel_data
+    if "rootfs" in stage_set:
+        tftp_files[tftp_alias["rootfs"]] = rootfs_data
 
     # --tftp-via=auto pre-flight: if the pod doesn't have enough
     # contiguous PSRAM for the firmware, fall back to host TFTP.
     # Surfaces "too-big rootfs" cleanly instead of OOMing the staging
     # POST mid-way.  --tftp-via=pod stays strict (error on OOM, no
     # silent fallback).
-    if use_pod_tftp and tftp_via == "auto":
+    if needs_tftp and use_pod_tftp and tftp_via == "auto":
         assert isinstance(power_controller, RackController)
         total_bytes = sum(len(d) for d in tftp_files.values())
         fits, pod_stats = await power_controller.psram_can_fit(total_bytes)
@@ -672,7 +724,7 @@ async def run_install(request: InstallRequest) -> None:
                 )
             use_pod_tftp = False
 
-    if not use_pod_tftp:
+    if needs_tftp and not use_pod_tftp:
         # Host TFTP needs a NIC + host_ip; pod path needs neither.
         if not nic:
             interfaces = await list_interfaces_async()
@@ -694,7 +746,7 @@ async def run_install(request: InstallRequest) -> None:
         #   replace_in_tftp() — async hook to swap a file mid-flow
         #                       (used by the UBI rootfs path below)
         tftp_protocol = None  # only used by host path's UBI replace
-        if use_pod_tftp:
+        if needs_tftp and use_pod_tftp:
             assert isinstance(power_controller, RackController)
             if output == "human":
                 console.print(
@@ -719,7 +771,7 @@ async def run_install(request: InstallRequest) -> None:
 
             if output == "human":
                 console.print(f"  [green]Pod TFTP ready on {serverip}:69[/green]")
-        else:
+        elif needs_tftp:
             await stack.enter_async_context(
                 temporary_ip(nic, host_ip, "255.255.255.0")
             )
@@ -750,26 +802,27 @@ async def run_install(request: InstallRequest) -> None:
             # legacy UART is fragile; verify loadaddr before relying on it.  The
             # generic boot-ROM/download-mode path keeps the historical explicit
             # tftpboot address so it does not depend on printenv formatting.
-            if has_stock_uboot:
-                await set_uboot_env_verified(_cmd, "ipaddr", device_ip)
-                await set_uboot_env_verified(_cmd, "serverip", serverip)
-                await set_uboot_env_verified(_cmd, "loadaddr", f"0x{ram_addr:x}")
-            else:
-                await _cmd(f"setenv ipaddr {device_ip}", timeout=3.0)
-                await _cmd(f"setenv serverip {serverip}", timeout=3.0)
-
-            if output == "human":
+            if needs_tftp:
                 if has_stock_uboot:
-                    console.print(
-                        f"  Runtime network verified: device=[cyan]{device_ip}[/cyan], "
-                        f"server=[cyan]{serverip}[/cyan], "
-                        f"loadaddr=[cyan]0x{ram_addr:x}[/cyan]"
-                    )
+                    await set_uboot_env_verified(_cmd, "ipaddr", device_ip)
+                    await set_uboot_env_verified(_cmd, "serverip", serverip)
+                    await set_uboot_env_verified(_cmd, "loadaddr", f"0x{ram_addr:x}")
                 else:
-                    console.print(
-                        f"  Device IP: [cyan]{device_ip}[/cyan], "
-                        f"server: [cyan]{serverip}[/cyan]"
-                    )
+                    await _cmd(f"setenv ipaddr {device_ip}", timeout=3.0)
+                    await _cmd(f"setenv serverip {serverip}", timeout=3.0)
+
+                if output == "human":
+                    if has_stock_uboot:
+                        console.print(
+                            f"  Runtime network verified: device=[cyan]{device_ip}[/cyan], "
+                            f"server=[cyan]{serverip}[/cyan], "
+                            f"loadaddr=[cyan]0x{ram_addr:x}[/cyan]"
+                        )
+                    else:
+                        console.print(
+                            f"  Device IP: [cyan]{device_ip}[/cyan], "
+                            f"server: [cyan]{serverip}[/cyan]"
+                        )
 
             async def _tftp_to_ram(filename: str, timeout: float = 120.0) -> str:
                 """TFTP download, preserving the generic explicit-address path."""
@@ -906,18 +959,20 @@ async def run_install(request: InstallRequest) -> None:
                 if output == "human":
                     console.print(f"  [green]{name} OK[/green]")
 
-            await tftp_and_flash(
-                "U-Boot", tftp_alias["uboot"], uboot_data, b_off, uboot_flash_size
-            )
-            await tftp_and_flash(
-                "kernel", tftp_alias["kernel"], kernel_data, k_off, k_sz
-            )
+            if "uboot" in stage_set:
+                await tftp_and_flash(
+                    "U-Boot", tftp_alias["uboot"], uboot_data, b_off, uboot_flash_size
+                )
+            if "kernel" in stage_set:
+                await tftp_and_flash(
+                    "kernel", tftp_alias["kernel"], kernel_data, k_off, k_sz
+                )
 
             # For NAND, raw UBI images must be written through UBI rather than
             # ``nand write`` because bad-block skipping would shift UBIFS data.
             from defib.ubi import extract_ubifs, is_ubi_image
 
-            if nand and is_ubi_image(rootfs_data):
+            if "rootfs" in stage_set and nand and is_ubi_image(rootfs_data):
                 if output == "human":
                     console.print(
                         f"\n  [bold]Flashing rootfs (UBI)[/bold] → 0x{r_off:X}"
@@ -960,12 +1015,12 @@ async def run_install(request: InstallRequest) -> None:
                     raise typer.Exit(1)
                 if output == "human":
                     console.print("  [green]rootfs (UBI) OK[/green]")
-            else:
+            elif "rootfs" in stage_set:
                 await tftp_and_flash(
                     "rootfs", tftp_alias["rootfs"], rootfs_data, r_off, r_sz
                 )
 
-            if has_stock_uboot and not nand:
+            if "rootfs-data" in stage_set and has_stock_uboot and not nand:
                 data_offset = r_off + r_sz
                 data_size = nor_size * 1024 * 1024 - data_offset
                 if data_size <= 0:
@@ -1020,7 +1075,7 @@ async def run_install(request: InstallRequest) -> None:
             # env backend sees the erased CRC and materializes compiled defaults.
             # After that Defib re-applies only install invariants plus instance
             # identity; device policy remains the firmware/profile's responsibility.
-            if has_stock_uboot and not nand:
+            if "env" in stage_set and has_stock_uboot and not nand:
                 pre_reset_eth_resp = await _cmd("printenv ethaddr", timeout=5.0)
                 pre_reset_eth = parse_printenv_value(pre_reset_eth_resp, "ethaddr")
                 preserved_eth = preserved_stock_env.get("ethaddr")
@@ -1083,7 +1138,7 @@ async def run_install(request: InstallRequest) -> None:
                     console.print("  [green]OpenIPC U-Boot defaults loaded[/green]")
 
             # Set up the persistent boot environment.
-            if nand:
+            if "env" in stage_set and nand:
                 if output == "human":
                     console.print("\n  [bold]Setting boot environment[/bold] (NAND)")
                 await _cmd(
@@ -1097,7 +1152,7 @@ async def run_install(request: InstallRequest) -> None:
                 )
                 bootargs = nand_bootargs(rootfs_is_ubi=is_ubi_image(rootfs_data))
                 await _cmd(f"setenv bootargs {bootargs}", timeout=3.0)
-            else:
+            elif "env" in stage_set:
                 if output == "human":
                     console.print("\n  [bold]Setting boot environment[/bold]")
 
@@ -1114,86 +1169,87 @@ async def run_install(request: InstallRequest) -> None:
                     await _cmd(f"setenv mtdparts {mtdparts}", timeout=3.0)
                     await _cmd("setenv bootcmd ${bootcmdnor}", timeout=3.0)
 
-            # Preserve a factory MAC captured from stock U-Boot. For normal
-            # boot-ROM installs keep the existing generic rescue-MAC behavior.
-            eth_resp = await _cmd("printenv ethaddr", timeout=5.0)
-            current_eth = parse_printenv_value(eth_resp, "ethaddr")
-            preserved_eth = preserved_stock_env.get("ethaddr")
-            selected_eth, eth_source = select_install_ethaddr(
-                current_eth,
-                preserved_eth,
-                allow_generate=not has_stock_uboot,
-            )
-            if selected_eth is None:
-                console.print(
-                    "[red]Factory ethaddr is unavailable; refusing to generate a "
-                    "replacement MAC for a stock U-Boot board.[/red]"
+            if "env" in stage_set:
+                # Preserve a factory MAC captured from stock U-Boot. For normal
+                # boot-ROM installs keep the existing generic rescue-MAC behavior.
+                eth_resp = await _cmd("printenv ethaddr", timeout=5.0)
+                current_eth = parse_printenv_value(eth_resp, "ethaddr")
+                preserved_eth = preserved_stock_env.get("ethaddr")
+                selected_eth, eth_source = select_install_ethaddr(
+                    current_eth,
+                    preserved_eth,
+                    allow_generate=not has_stock_uboot,
                 )
-                raise typer.Exit(1)
-
-            if current_eth is None or current_eth.lower() != selected_eth.lower():
-                if output == "human":
-                    if eth_source == "preserved":
-                        console.print(
-                            f"  Restoring factory ethaddr: [cyan]{selected_eth}[/cyan]"
-                        )
-                    elif eth_source == "generated":
-                        console.print(
-                            f"  ethaddr unavailable — assigning rescue MAC "
-                            f"[cyan]{selected_eth}[/cyan]"
-                        )
-                if has_stock_uboot:
-                    await set_uboot_env_verified(_cmd, "ethaddr", selected_eth)
-                else:
-                    await _cmd(f"setenv ethaddr {selected_eth}", timeout=3.0)
-            elif output == "human":
-                label = "factory" if eth_source == "preserved" else "current"
-                console.print(
-                    f"  ethaddr preserved ({label}): [cyan]{selected_eth}[/cyan]"
-                )
-
-            save_resp = await _cmd("saveenv", timeout=10.0)
-            if uboot_flash_command_error(save_resp):
-                raise RuntimeError(f"saveenv failed: {save_resp.strip()}")
-
-            if has_stock_uboot:
-                env_off, env_size = nor_layout(nor_size)["env"]
-                persisted_crc = await verify_spi_environment_crc(
-                    _cmd,
-                    env_off=env_off,
-                    env_size=env_size,
-                    ram_addr=ram_addr,
-                )
-
-                verify_resp = await _cmd("printenv ethaddr", timeout=5.0)
-                saved_eth = parse_printenv_value(verify_resp, "ethaddr")
-                if saved_eth is None or saved_eth.lower() != selected_eth.lower():
-                    raise RuntimeError(
-                        "environment verify failed for ethaddr: "
-                        f"expected={selected_eth!r} got={saved_eth!r}"
-                    )
-
-                verify_mtd_resp = await _cmd("printenv mtdparts", timeout=5.0)
-                saved_mtdparts = parse_printenv_value(verify_mtd_resp, "mtdparts")
-                expected_mtdparts = nor_mtdparts(nor_size)
-                if saved_mtdparts != expected_mtdparts:
-                    raise RuntimeError(
-                        "environment verify failed for mtdparts: "
-                        f"expected={expected_mtdparts!r} got={saved_mtdparts!r}"
-                    )
-                if output == "human":
+                if selected_eth is None:
                     console.print(
-                        "  [green]Environment saved and verified "
-                        f"(SPI CRC {persisted_crc:08X})[/green]"
+                        "[red]Factory ethaddr is unavailable; refusing to generate a "
+                        "replacement MAC for a stock U-Boot board.[/red]"
                     )
-            elif output == "human":
-                console.print("  [green]Environment saved[/green]")
+                    raise typer.Exit(1)
 
-            if final_reset:
+                if current_eth is None or current_eth.lower() != selected_eth.lower():
+                    if output == "human":
+                        if eth_source == "preserved":
+                            console.print(
+                                f"  Restoring factory ethaddr: [cyan]{selected_eth}[/cyan]"
+                            )
+                        elif eth_source == "generated":
+                            console.print(
+                                f"  ethaddr unavailable — assigning rescue MAC "
+                                f"[cyan]{selected_eth}[/cyan]"
+                            )
+                    if has_stock_uboot:
+                        await set_uboot_env_verified(_cmd, "ethaddr", selected_eth)
+                    else:
+                        await _cmd(f"setenv ethaddr {selected_eth}", timeout=3.0)
+                elif output == "human":
+                    label = "factory" if eth_source == "preserved" else "current"
+                    console.print(
+                        f"  ethaddr preserved ({label}): [cyan]{selected_eth}[/cyan]"
+                    )
+
+                save_resp = await _cmd("saveenv", timeout=10.0)
+                if uboot_flash_command_error(save_resp):
+                    raise RuntimeError(f"saveenv failed: {save_resp.strip()}")
+
+                if has_stock_uboot:
+                    env_off, env_size = nor_layout(nor_size)["env"]
+                    persisted_crc = await verify_spi_environment_crc(
+                        _cmd,
+                        env_off=env_off,
+                        env_size=env_size,
+                        ram_addr=ram_addr,
+                    )
+
+                    verify_resp = await _cmd("printenv ethaddr", timeout=5.0)
+                    saved_eth = parse_printenv_value(verify_resp, "ethaddr")
+                    if saved_eth is None or saved_eth.lower() != selected_eth.lower():
+                        raise RuntimeError(
+                            "environment verify failed for ethaddr: "
+                            f"expected={selected_eth!r} got={saved_eth!r}"
+                        )
+
+                    verify_mtd_resp = await _cmd("printenv mtdparts", timeout=5.0)
+                    saved_mtdparts = parse_printenv_value(verify_mtd_resp, "mtdparts")
+                    expected_mtdparts = nor_mtdparts(nor_size)
+                    if saved_mtdparts != expected_mtdparts:
+                        raise RuntimeError(
+                            "environment verify failed for mtdparts: "
+                            f"expected={expected_mtdparts!r} got={saved_mtdparts!r}"
+                        )
+                    if output == "human":
+                        console.print(
+                            "  [green]Environment saved and verified "
+                            f"(SPI CRC {persisted_crc:08X})[/green]"
+                        )
+                elif output == "human":
+                    console.print("  [green]Environment saved[/green]")
+
+            if "reset" in stage_set:
                 if output == "human":
                     console.print("\n  [bold]Resetting device...[/bold]")
                 await _cmd("reset", timeout=3.0)
-            elif output == "human":
+            elif output == "human" and "env" in stage_set:
                 console.print(
                     "\n  [yellow]Final reset skipped; device left at U-Boot prompt.[/yellow]"
                 )
@@ -1204,7 +1260,7 @@ async def run_install(request: InstallRequest) -> None:
         # clearing pod TFTP state plus UART/power resources.
 
     if output == "human":
-        if final_reset:
+        if "reset" in stage_set:
             console.print(
                 "\n[green bold]Install complete![/green bold] "
                 "Device is rebooting into OpenIPC."

@@ -68,12 +68,13 @@ detected capacity Defib emits a warning and honours the explicit value.
 ## Environment migration
 
 Persistent environment from stock or an older OpenIPC U-Boot can shadow the
-compiled defaults of a newly flashed U-Boot. This migration therefore requires
-an explicit `--wipe-env`; Defib refuses to start the stock-U-Boot NOR path
-without it. The factory `ethaddr` is captured before the erase and restored
-after the new U-Boot loads its compiled defaults.
+compiled defaults of a newly flashed U-Boot. When the `env` stage is selected
+for a stock-U-Boot NOR migration, it therefore requires explicit `--wipe-env`;
+other selected stages do not require an environment wipe. The factory
+`ethaddr` is captured before the erase and restored after the new U-Boot loads
+its compiled defaults.
 
-With that opt-in, Defib:
+With that env-stage opt-in, Defib:
 
 1. captures the factory `ethaddr`;
 2. applies transient installer settings such as `phyaddru=3`;

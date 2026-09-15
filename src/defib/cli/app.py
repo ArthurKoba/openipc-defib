@@ -2174,8 +2174,9 @@ def install(
         False,
         "--wipe-env",
         help=(
-            "Erase the persistent U-Boot environment. Required for registered "
-            "stock-U-Boot migrations; their captured factory ethaddr is restored."
+            "Erase the persistent U-Boot environment when the env stage runs. "
+            "Required for the env stage on registered stock-U-Boot migrations; "
+            "their captured factory ethaddr is restored."
         ),
     ),
     final_reset: bool = typer.Option(
@@ -2184,6 +2185,23 @@ def install(
         help=(
             "Reset into OpenIPC when installation completes; "
             "use --no-final-reset to leave the device at the U-Boot prompt."
+        ),
+    ),
+    stage: list[str] | None = typer.Option(
+        None,
+        "--stage",
+        help=(
+            "Run only the named install stage; repeat for combinations. "
+            "Stages: uboot, kernel, rootfs, rootfs-data, env, reset. "
+            "With --stage, reset runs only when explicitly selected."
+        ),
+    ),
+    skip_stage: list[str] | None = typer.Option(
+        None,
+        "--skip-stage",
+        help=(
+            "Skip a named stage from the normal production install; repeat as needed. "
+            "Cannot be combined with --stage."
         ),
     ),
     tftp_via: str = typer.Option(
@@ -2217,6 +2235,8 @@ def install(
         nand=nand,
         wipe_env=wipe_env,
         final_reset=final_reset,
+        stages=tuple(stage or ()),
+        skip_stages=tuple(skip_stage or ()),
         tftp_via=tftp_via,
         output=output,
         debug=debug,

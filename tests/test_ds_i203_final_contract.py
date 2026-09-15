@@ -235,6 +235,7 @@ async def test_ds_i203_final_migration_contract_all_uboot_outcomes(
             transport, firmware, filename=artifact
         )
         assert result.recovery.success is True
+        assert result.chainloaded is False
         assert result.preserved_env == {}
         assert b"loady " not in transport.all_tx
         assert b"\x03\r" in transport.all_tx
@@ -245,6 +246,7 @@ async def test_ds_i203_final_migration_contract_all_uboot_outcomes(
             transport, firmware, filename=artifact
         )
         assert result.recovery.success is True
+        assert result.chainloaded is True
         assert result.preserved_env == {"ethaddr": FACTORY_MAC}
         assert b"printenv ethaddr\r" in transport.all_tx
         assert b"loady 0x81000000\r" in transport.all_tx

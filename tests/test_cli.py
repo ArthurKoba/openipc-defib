@@ -96,6 +96,14 @@ class TestPoePortOverride:
         out = _strip_ansi(result.stdout)
         assert "--poe-port" in out
 
+    def test_install_help_documents_stage_selection(self):
+        result = runner.invoke(app, ["install", "--help"])
+        assert result.exit_code == 0
+        out = _strip_ansi(result.stdout)
+        assert "--stage" in out
+        assert "--skip-stage" in out
+        assert "rootfs-data" in out
+
     def test_restore_help_documents_poe_port(self):
         result = runner.invoke(app, ["restore", "--help"])
         assert result.exit_code == 0

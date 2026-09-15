@@ -19,6 +19,7 @@ class UBootBootstrapResult:
 
     recovery: RecoveryResult
     preserved_env: dict[str, str] = field(default_factory=dict)
+    chainloaded: bool = False
 
 
 class UBootBootstrap(Protocol):

@@ -91,8 +91,10 @@ handling lives in `defib.vendors.hikvision`. The registry also carries any
 installer-only runtime environment required to complete the migration (for the
 DS-I203, `phyaddru=3` so the chainloaded U-Boot can use TFTP). These values are
 transient and disappear when Defib replaces the old persistent environment.
-Stock-U-Boot NOR migrations require explicit `--wipe-env`; Defib refuses to
-start that migration otherwise, and restores the captured factory `ethaddr`.
+The `env` stage on a stock-U-Boot NOR migration requires explicit
+`--wipe-env`; Defib refuses that destructive environment migration otherwise,
+and restores the captured factory `ethaddr`. Other selected stages can be run
+without wiping the environment.
 
 The release U-Boot owns boot-critical hardware initialization such as DDR
 cold-init and RAM probing limits. Defib owns the layout it actually flashes: it
@@ -101,6 +103,41 @@ persists the matching `mtdparts` before the first Linux boot. Device runtime
 policy such as `osmem`, Linux PHY parameters and sensor selection belongs to the
 firmware/device profile. An explicit local U-Boot can still be supplied with
 `--uboot`.
+
+For development and hardware bring-up, `install` can run a selected subset of
+the destructive stages without changing the default production flow. Repeat
+`--stage` to build an exact plan, or repeat `--skip-stage` to subtract from the
+normal full install. Available stages are `uboot`, `kernel`, `rootfs`,
+`rootfs-data`, `env`, and `reset`.
+
+```bash
+# On a device that already boots OpenIPC U-Boot, re-run only persistent
+# environment migration/verification. No TFTP starts and U-Boot/kernel/rootfs
+# are left untouched. Exact stage selection does not imply the final reset
+# unless `--stage reset` is also present.
+defib install -c hi3518ev100:hiwatch-ds-i203 \
+  --firmware hi3518ev100_lite_hiwatch-ds-i203-nor.tgz \
+  --uboot u-boot-hi3518ev100-ddr3-256m-universal.bin \
+  --wipe-env --stage env -p /dev/ttyUSB0 -d
+
+# Starting from genuine stock U-Boot, include the bootloader write before env.
+defib install -c hi3518ev100:hiwatch-ds-i203 \
+  --firmware hi3518ev100_lite_hiwatch-ds-i203-nor.tgz \
+  --uboot u-boot-hi3518ev100-ddr3-256m-universal.bin \
+  --wipe-env --stage uboot --stage env -p /dev/ttyUSB0 -d
+
+# Full production plan except kernel/rootfs writes.
+defib install -c hi3518ev100:hiwatch-ds-i203 \
+  --firmware hi3518ev100_lite_hiwatch-ds-i203-nor.tgz \
+  --wipe-env --skip-stage kernel --skip-stage rootfs -p /dev/ttyUSB0
+```
+
+`--stage` and `--skip-stage` are mutually exclusive. On a registered stock
+U-Boot target, if Defib actually had to chainload OpenIPC U-Boot from the
+factory bootloader, a partial persistent plan must include the `uboot` stage;
+this prevents an accidental kernel/rootfs/environment migration while leaving
+the factory bootloader installed. Later partial stages are available once the
+device already boots OpenIPC U-Boot.
 
 ## Flash Dump Restore
 

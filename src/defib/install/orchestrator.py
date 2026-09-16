@@ -658,6 +658,30 @@ async def run_install(request: InstallRequest) -> None:
         if len(rootfs_data) > r_sz:
             await close_and_fail(f"Rootfs too large: {len(rootfs_data)} > {r_sz}")
 
+        persistent_nor_stages = {"uboot", "kernel", "rootfs", "rootfs-data", "env"}
+        if stage_set & persistent_nor_stages:
+            unlock_resp = await _cmd("sf lock 0", timeout=5.0)
+            unlock_text = unlock_resp.lower()
+            unlock_unsupported = (
+                "unknown command" in unlock_text
+                or "usage:" in unlock_text
+                or "not supported" in unlock_text
+                or "unsupported" in unlock_text
+            )
+            if unlock_unsupported:
+                warn(
+                    "U-Boot does not expose a usable `sf lock` command; "
+                    "continuing and relying on erase/write result checks."
+                )
+            else:
+                unlock_error = uboot_flash_command_error(unlock_resp)
+                if unlock_error:
+                    await close_and_fail(
+                        f"SPI NOR unlock failed ({unlock_error}): {unlock_resp.strip()}"
+                    )
+                if output == "human":
+                    console.print("  [green]SPI NOR write protection cleared[/green]")
+
         if output == "human":
             console.print(
                 f"  [green]SPI flash detected[/green]: {nor_size} MiB ({nor_source}), "

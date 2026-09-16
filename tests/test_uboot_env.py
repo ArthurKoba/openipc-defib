@@ -7,6 +7,7 @@ from defib.uboot_env import (
     generate_locally_administered_mac,
     is_unset_or_default_ethaddr,
     parse_printenv_value,
+    select_install_ethaddr,
 )
 
 _MAC_RE = re.compile(r"^([0-9a-f]{2}:){5}[0-9a-f]{2}$")
@@ -104,3 +105,32 @@ def test_default_const_is_what_we_observed():
     # binaries (hi3516av200 + hi3516cv300). If OpenIPC ever changes the
     # baked-in default, this test breaks loudly so we know to update.
     assert OPENIPC_DEFAULT_ETHADDR == "00:00:23:34:45:66"
+
+
+class TestSelectInstallEthaddr:
+    def test_preserved_factory_mac_wins(self):
+        value, source = select_install_ethaddr(
+            "02:aa:bb:cc:dd:ee", "18:68:cb:6b:e6:64", allow_generate=False
+        )
+        assert value == "18:68:cb:6b:e6:64"
+        assert source == "preserved"
+
+    def test_current_valid_mac_is_kept_without_factory_value(self):
+        value, source = select_install_ethaddr(
+            "02:aa:bb:cc:dd:ee", None, allow_generate=False
+        )
+        assert value == "02:aa:bb:cc:dd:ee"
+        assert source == "current"
+
+    def test_vendor_install_refuses_to_invent_missing_identity(self):
+        value, source = select_install_ethaddr(
+            OPENIPC_DEFAULT_ETHADDR, None, allow_generate=False
+        )
+        assert value is None
+        assert source == "missing"
+
+    def test_generic_install_can_generate_rescue_mac(self):
+        value, source = select_install_ethaddr(None, None, allow_generate=True)
+        assert value is not None
+        assert _MAC_RE.match(value)
+        assert source == "generated"

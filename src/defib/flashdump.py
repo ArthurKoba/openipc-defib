@@ -16,6 +16,7 @@ The md.b output format:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import time
@@ -40,6 +41,7 @@ RAM_BASE: dict[str, int] = {
     "hi3516dv100": 0x80000000,
     "hi3516dv300": 0x80000000,
     "hi3518": 0x80000000,
+    "hi3518ev100": 0x80000000,
     "hi3518ev200": 0x80000000,
     "hi3520d": 0x80000000,
     "hi3531": 0x80000000,
@@ -87,7 +89,10 @@ def get_ram_staging_addr(chip: str) -> int:
     Looks up the chip's RAM base from the known table, falling back to
     the profile's U-Boot load address if not found.
     """
-    chip_lower = chip.lower()
+    # Board/vendor selectors use ``soc:variant`` but RAM geometry belongs to
+    # the SoC.  Strip the suffix before the exact table lookup so staging does
+    # not depend on the order of the broad legacy prefix fallbacks below.
+    chip_lower = chip.lower().split(":", 1)[0]
     # Direct match
     if chip_lower in RAM_BASE:
         return RAM_BASE[chip_lower] + RAM_STAGING_OFFSET
@@ -160,24 +165,119 @@ def parse_md_output(text: str) -> bytes:
     return bytes(buf)
 
 
+async def _read_until_prompt(
+    transport: Transport,
+    prompt: bytes = b"# ",
+    timeout: float = 2.0,
+) -> bytes:
+    """Collect bytes until a U-Boot prompt appears or timeout expires."""
+    buf = bytearray()
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            data = await transport.read(256, timeout=0.1)
+        except TransportTimeout:
+            continue
+        if not data:
+            continue
+        buf.extend(data)
+        if prompt in buf[-128:]:
+            break
+    return bytes(buf)
+
+
+async def _cancel_partial_uboot_line(transport: Transport) -> None:
+    """Abort a partially entered U-Boot line and return to a clean prompt."""
+    # Ctrl-C is handled by the hush/CLI editor before command execution.  Send
+    # several copies because this helper is specifically used on an unreliable
+    # UART link, then press Enter and wait for the prompt to settle.
+    for _ in range(3):
+        await transport.write(b"\x03")
+        await asyncio.sleep(0.01)
+    await transport.write(b"\r")
+    await _read_until_prompt(transport, timeout=2.0)
+
+
+async def write_uboot_line_with_echo_verify(
+    transport: Transport,
+    cmd: str,
+    *,
+    retries: int = 8,
+    echo_timeout: float = 0.35,
+) -> None:
+    """Enter a U-Boot command only after every character echoes correctly.
+
+    The Hi3518E vendor UART path under test occasionally corrupts individual
+    bytes even though the host-side Serial.write() received the right data.
+    U-Boot echoes line-editor input before execution, so use that echo as an
+    acknowledgement channel.  The terminating CR is sent only after every
+    printable command byte has been acknowledged byte-for-byte.
+    """
+    encoded = cmd.encode("ascii")
+
+    for attempt in range(1, retries + 1):
+        mismatch: tuple[int, int, bytes] | None = None
+
+        for pos, expected in enumerate(encoded):
+            await transport.write(bytes((expected,)))
+            try:
+                echoed = await transport.read(1, timeout=echo_timeout)
+            except TransportTimeout:
+                echoed = b""
+
+            if echoed != bytes((expected,)):
+                mismatch = (pos, expected, echoed)
+                break
+
+        if mismatch is None:
+            # Only execute after the complete line was echoed correctly.
+            await transport.write(b"\r")
+            await transport.flush_output()
+            logger.debug(
+                "UART command echo verified (%d bytes): %r", len(encoded), cmd
+            )
+            return
+
+        pos, expected, echoed = mismatch
+        logger.warning(
+            "UART echo mismatch entering command (attempt %d/%d, pos=%d, "
+            "tx=%02x, rx=%s); cancelling line and retrying",
+            attempt,
+            retries,
+            pos,
+            expected,
+            echoed.hex() if echoed else "timeout",
+        )
+        await _cancel_partial_uboot_line(transport)
+
+        # Clear anything that arrived after the prompt before retyping.
+        try:
+            avail = await transport.bytes_waiting()
+            if avail:
+                await transport.read(avail, timeout=0.1)
+        except Exception:
+            pass
+
+    raise TransportTimeout(
+        f"UART command echo verification failed after {retries} attempts: {cmd!r}"
+    )
+
+
 async def send_command(
     transport: Transport,
     cmd: str,
     timeout: float = 5.0,
     wait_for: str | None = None,
+    verify_echo: bool = False,
 ) -> str:
     """Send a command to U-Boot and collect the response.
 
-    Args:
-        transport: Serial transport with U-Boot console active.
-        cmd: Command string to send.
-        timeout: Max seconds to wait for response.
-        wait_for: Optional string to wait for in response (e.g., prompt).
-
-    Returns:
-        The collected response text.
+    ``verify_echo`` is intended for fragile legacy UART consoles.  When set,
+    the command is entered one character at a time and U-Boot must echo every
+    byte correctly before the final carriage return is sent.  This prevents a
+    corrupted ``sf erase/write/read`` line from ever being executed.
     """
-    # Clear any pending input
+    # Clear any pending input.
     try:
         avail = await transport.bytes_waiting()
         if avail > 0:
@@ -185,7 +285,13 @@ async def send_command(
     except Exception:
         pass
 
-    await transport.write((cmd + "\r").encode())
+    logger.debug("UART CMD: %r", cmd)
+
+    if verify_echo:
+        await write_uboot_line_with_echo_verify(transport, cmd)
+    else:
+        await transport.write((cmd + "\r").encode("ascii"))
+
     buf = bytearray()
     start = time.monotonic()
     idle_time = 0.0

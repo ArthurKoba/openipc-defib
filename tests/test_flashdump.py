@@ -186,6 +186,10 @@ class TestGetRamStagingAddr:
         assert addr >= 0x80000000
         assert addr < 0x90000000
 
+    def test_hi3518ev100_ram_at_0x80_without_prefix_fallback(self):
+        assert get_ram_staging_addr("hi3518ev100") == 0x82000000
+        assert get_ram_staging_addr("hi3518ev100:hiwatch-ds-i203") == 0x82000000
+
     def test_hi3516cv610_ram_at_0x40(self):
         addr = get_ram_staging_addr("hi3516cv610")
         assert addr >= 0x40000000

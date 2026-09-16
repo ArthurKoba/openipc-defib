@@ -61,3 +61,27 @@ def parse_printenv_value(response: str, var: str) -> str | None:
     pattern = re.compile(rf"(?m)^\s*{re.escape(var)}=(.+?)\s*$")
     m = pattern.search(response)
     return m.group(1).strip() if m else None
+
+
+def select_install_ethaddr(
+    current: str | None,
+    preserved: str | None,
+    *,
+    allow_generate: bool,
+) -> tuple[str | None, str]:
+    """Choose the MAC address that may be persisted by an install.
+
+    A valid factory MAC captured before a vendor chainload takes precedence.
+    Otherwise a valid current address is retained.  Generic boot-ROM installs
+    may generate a rescue MAC; vendor-bootstrap installs can disable that so a
+    missing factory identity fails safely instead of being replaced.
+    """
+    if not is_unset_or_default_ethaddr(preserved):
+        assert preserved is not None
+        return preserved.strip().lower(), "preserved"
+    if not is_unset_or_default_ethaddr(current):
+        assert current is not None
+        return current.strip().lower(), "current"
+    if allow_generate:
+        return generate_locally_administered_mac(), "generated"
+    return None, "missing"

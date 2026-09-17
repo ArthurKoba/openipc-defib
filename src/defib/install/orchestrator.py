@@ -74,6 +74,7 @@ async def run_install(request: InstallRequest) -> None:
     nor_size = request.nor_size
     nand = request.nand
     wipe_env = request.wipe_env
+    wipe_rootfs_data = request.wipe_rootfs_data
     final_reset = request.final_reset
     tftp_via = request.tftp_via
     output = request.output
@@ -108,6 +109,19 @@ async def run_install(request: InstallRequest) -> None:
 
     if stage_error is not None:
         fail(stage_error, exit_code=2)
+
+    skipped_stage_set = {
+        stage.strip().lower()
+        for stage in request.skip_stages
+        if stage.strip()
+    }
+    if wipe_rootfs_data and "rootfs-data" in skipped_stage_set:
+        fail(
+            "--wipe-rootfs-data conflicts with --skip-stage rootfs-data",
+            exit_code=2,
+        )
+    if wipe_rootfs_data and nand:
+        fail("--wipe-rootfs-data is only supported for NOR installs", exit_code=2)
 
     stage_set = set(stages)
     needs_tftp = bool(stage_set & {"uboot", "kernel", "rootfs"})
@@ -451,6 +465,8 @@ async def run_install(request: InstallRequest) -> None:
 
     if vendor_chainloaded:
         partial_persistent = stage_set & {"kernel", "rootfs", "rootfs-data", "env"}
+        if wipe_rootfs_data:
+            partial_persistent.add("rootfs-data")
         if partial_persistent and "uboot" not in stage_set:
             await transport.close()
             if power_controller:
@@ -1020,7 +1036,14 @@ async def run_install(request: InstallRequest) -> None:
                     "rootfs", tftp_alias["rootfs"], rootfs_data, r_off, r_sz
                 )
 
-            if "rootfs-data" in stage_set and has_stock_uboot and not nand:
+            erase_rootfs_data = (
+                not nand
+                and (
+                    wipe_rootfs_data
+                    or ("rootfs-data" in stage_set and has_stock_uboot)
+                )
+            )
+            if erase_rootfs_data:
                 data_offset = r_off + r_sz
                 data_size = nor_size * 1024 * 1024 - data_offset
                 if data_size <= 0:

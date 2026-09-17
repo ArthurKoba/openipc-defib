@@ -32,6 +32,9 @@ from defib.install.layout import (
 from defib.install.model import InstallRequest, resolve_install_stages
 
 
+TFTP_RAM_VERIFY_RETRIES = 1
+
+
 async def run_install(request: InstallRequest) -> None:
     import json as json_mod
     import logging
@@ -50,7 +53,7 @@ async def run_install(request: InstallRequest) -> None:
     )
     from defib.flashdump import get_ram_staging_addr, send_command
     from defib.network.ip_manager import list_interfaces_async, temporary_ip
-    from defib.network.tftp_server import start_tftp_server
+    from defib.network.tftp_server import DEFAULT_BLOCKSIZE, start_tftp_server
     from defib.profiles.loader import recovery_mode
     from defib.recovery.events import LogEvent, ProgressEvent
     from defib.recovery.session import RecoverySession
@@ -555,22 +558,46 @@ async def run_install(request: InstallRequest) -> None:
         from defib.protocol.download_cmd import DownloadCommandClient
         dl_client = DownloadCommandClient(transport)
 
-        async def _cmd(cmd: str, timeout: float = 60.0, **kw: object) -> str:
+        async def _cmd_result(
+            cmd: str,
+            timeout: float = 60.0,
+            *,
+            allow_failure: bool = False,
+            **kw: object,
+        ) -> tuple[bool, str]:
             try:
                 ok, out = await dl_client.send_command(cmd, timeout=timeout)
             except TransportError as exc:
-                await close_and_fail(f"U-Boot transport failed while running {cmd!r}: {exc}")
-            if not ok and output == "human":
-                console.print(f"  [yellow]Warning: {cmd} → ERROR[/yellow]")
+                await close_and_fail(
+                    f"U-Boot transport failed while running {cmd!r}: {exc}"
+                )
+            if not ok and not allow_failure:
+                detail = out.strip()[-200:] or "<no response>"
+                await close_and_fail(
+                    f"U-Boot command failed or timed out while running {cmd!r}: "
+                    f"{detail}"
+                )
+            return ok, out
+
+        async def _cmd(cmd: str, timeout: float = 60.0, **kw: object) -> str:
+            del kw
+            _, out = await _cmd_result(cmd, timeout=timeout)
             return out
     else:
         if output == "human":
             console.print("  [cyan]U-Boot shell mode[/cyan]")
 
-        async def _cmd(cmd: str, timeout: float = 60.0, **kw: object) -> str:
+        async def _cmd_result(
+            cmd: str,
+            timeout: float = 60.0,
+            *,
+            allow_failure: bool = False,
+            **kw: object,
+        ) -> tuple[bool, str]:
             # Stock U-Boot consoles on older HiSilicon boards can corrupt bytes while
-            # a line is being entered.  For those boards, require U-Boot to echo
-            # every character before Enter is sent.
+            # a line is being entered. For those boards, require U-Boot to echo
+            # every character before Enter is sent. send_command also requires the
+            # prompt to return, so a partial response cannot advance the install.
             for attempt in range(2):
                 try:
                     out = await send_command(
@@ -585,10 +612,36 @@ async def run_install(request: InstallRequest) -> None:
                         f"U-Boot transport failed while running {cmd!r}: {exc}"
                     )
                 if "unknown command" not in out.lower() or attempt == 1:
-                    return out
+                    return True, out
                 await transport.write(b"\x03\r")
                 await _aio.sleep(0.05)
+            return True, out
+
+        async def _cmd(cmd: str, timeout: float = 60.0, **kw: object) -> str:
+            del kw
+            _, out = await _cmd_result(cmd, timeout=timeout)
             return out
+
+    async def _reset_command(timeout: float) -> None:
+        """Issue reset without requiring the old U-Boot prompt to return."""
+        if download_mode:
+            # download_process may reset before it can emit [EOT](OK). Preserve
+            # the historical behavior: once reset is issued, lack of a protocol
+            # completion marker is not itself an install failure.
+            await _cmd_result("reset", timeout=timeout, allow_failure=True)
+            return
+        try:
+            await send_command(
+                transport,
+                "reset",
+                timeout=timeout,
+                wait_for=None,
+                verify_echo=verify_shell_echo,
+            )
+        except TransportError as exc:
+            await close_and_fail(
+                f"U-Boot transport failed while running 'reset': {exc}"
+            )
 
     async def _set_env_verified_or_fail(key: str, value: str) -> None:
         try:
@@ -629,8 +682,11 @@ async def run_install(request: InstallRequest) -> None:
             console.print("  [green]NAND flash detected[/green]")
     else:
         resp = await _cmd("sf probe 0", timeout=5.0)
-        if "error" in resp.lower() or "fail" in resp.lower():
-            await close_and_fail(f"sf probe failed: {resp.strip()}")
+        probe_error = uboot_flash_command_error(resp)
+        if probe_error:
+            await close_and_fail(
+                f"sf probe failed ({probe_error}): {resp.strip()}"
+            )
         block_match = re_mod.search(r"Block:\s*(\d+)\s*KB", resp, re_mod.IGNORECASE)
         if block_match:
             nor_erase_block = int(block_match.group(1)) * 1024
@@ -660,7 +716,11 @@ async def run_install(request: InstallRequest) -> None:
 
         persistent_nor_stages = {"uboot", "kernel", "rootfs", "rootfs-data", "env"}
         if stage_set & persistent_nor_stages:
-            unlock_resp = await _cmd("sf lock 0", timeout=5.0)
+            unlock_ok, unlock_resp = await _cmd_result(
+                "sf lock 0",
+                timeout=5.0,
+                allow_failure=True,
+            )
             unlock_text = unlock_resp.lower()
             unlock_unsupported = (
                 "unknown command" in unlock_text
@@ -672,6 +732,11 @@ async def run_install(request: InstallRequest) -> None:
                 warn(
                     "U-Boot does not expose a usable `sf lock` command; "
                     "continuing and relying on erase/write result checks."
+                )
+            elif not unlock_ok:
+                detail = unlock_resp.strip()[-200:] or "<no response>"
+                await close_and_fail(
+                    f"SPI NOR unlock command failed or timed out: {detail}"
                 )
             else:
                 unlock_error = uboot_flash_command_error(unlock_resp)
@@ -855,12 +920,101 @@ async def run_install(request: InstallRequest) -> None:
                     ram_addr,
                     use_loadaddr=has_stock_uboot,
                 )
-                resp = await _cmd(tftpboot_cmd, timeout=timeout)
+                ok, resp = await _cmd_result(
+                    tftpboot_cmd,
+                    timeout=timeout,
+                    allow_failure=True,
+                )
                 if "unknown command" in resp.lower():
-                    resp = await _cmd(tftp_cmd, timeout=timeout)
+                    ok, resp = await _cmd_result(
+                        tftp_cmd,
+                        timeout=timeout,
+                        allow_failure=True,
+                    )
+                if not ok:
+                    detail = resp.strip()[-200:] or "<no response>"
+                    raise RuntimeError(f"TFTP command failed or timed out: {detail}")
                 if "done" not in resp.lower() and "bytes transferred" not in resp.lower():
                     raise RuntimeError(f"TFTP download failed: {resp.strip()[-200:]}")
                 return resp
+
+            async def _verify_tftp_ram(
+                name: str,
+                tftp_name: str,
+                orig_data: bytes,
+                expected_crc: int,
+            ) -> int:
+                """Verify TFTP staging before any persistent write."""
+                attempts = TFTP_RAM_VERIFY_RETRIES + 1
+                for attempt in range(attempts):
+                    failure: str
+                    try:
+                        tftp_resp = await _tftp_to_ram(tftp_name, timeout=120.0)
+                    except RuntimeError as exc:
+                        failure = str(exc)
+                    else:
+                        size_match = re_mod.search(
+                            r"bytes transferred\s*=\s*(\d+)",
+                            tftp_resp,
+                            re_mod.IGNORECASE,
+                        )
+                        reported_size = (
+                            int(size_match.group(1))
+                            if size_match is not None
+                            else None
+                        )
+                        if (
+                            reported_size is not None
+                            and reported_size != len(orig_data)
+                        ):
+                            failure = (
+                                f"reported {reported_size} bytes, "
+                                f"expected {len(orig_data)}"
+                            )
+                        else:
+                            crc_resp = await _cmd(
+                                f"crc32 0x{ram_addr:x} 0x{len(orig_data):x}",
+                                timeout=10.0,
+                            )
+                            ram_crc = parse_uboot_crc32(crc_resp)
+                            if ram_crc is None:
+                                failure = (
+                                    "CRC response did not contain a complete "
+                                    f"checksum: {crc_resp.strip()[-120:]}"
+                                )
+                            elif ram_crc == expected_crc:
+                                return ram_crc
+                            else:
+                                failure = (
+                                    f"CRC expected={expected_crc:08X} "
+                                    f"got={ram_crc:08X}"
+                                )
+
+                    if attempt < TFTP_RAM_VERIFY_RETRIES:
+                        next_attempt = attempt + 2
+                        if tftp_protocol is not None:
+                            tftp_protocol.set_max_blocksize(DEFAULT_BLOCKSIZE)
+                            warn(
+                                f"Attempt {next_attempt}: fetching TFTP file "
+                                f"{tftp_name!r} again for {name} after RAM "
+                                f"verification failed ({failure}); using "
+                                f"{DEFAULT_BLOCKSIZE}-byte blocks."
+                            )
+                        else:
+                            warn(
+                                f"Attempt {next_attempt}: fetching TFTP file "
+                                f"{tftp_name!r} again for {name} after RAM "
+                                f"verification failed ({failure})."
+                            )
+                        continue
+
+                    console.print(
+                        f"[red]{name} TFTP RAM verification failed after "
+                        f"{attempts} attempt(s):[/red] {failure}"
+                    )
+                    raise typer.Exit(1)
+
+                raise AssertionError("unreachable TFTP verification state")
 
             async def tftp_and_flash(
                 name: str, tftp_name: str, orig_data: bytes,
@@ -873,31 +1027,15 @@ async def run_install(request: InstallRequest) -> None:
                         f"({len(orig_data)} bytes)"
                     )
 
-                try:
-                    resp = await _tftp_to_ram(tftp_name, timeout=120.0)
-                except RuntimeError as e:
-                    console.print(f"[red]TFTP failed for {name}:[/red] {e}")
-                    raise typer.Exit(1)
-
-                # Verify TFTP transfer in RAM before writing to flash
+                # Verify TFTP transfer in RAM before writing to flash. A completed
+                # transfer with bad RAM contents gets one conservative retry.
                 expected_crc = zlib.crc32(orig_data) & 0xFFFFFFFF
-                resp = await _cmd(
-                    f"crc32 0x{ram_addr:x} 0x{len(orig_data):x}",
-                    timeout=10.0,
+                ram_crc = await _verify_tftp_ram(
+                    name,
+                    tftp_name,
+                    orig_data,
+                    expected_crc,
                 )
-                ram_crc = parse_uboot_crc32(resp)
-                if ram_crc is None:
-                    console.print(
-                        f"[red]{name} CRC check after TFTP returned no checksum:[/red] "
-                        f"{resp.strip()[-200:]}"
-                    )
-                    raise typer.Exit(1)
-                if ram_crc != expected_crc:
-                    console.print(
-                        f"[red]{name} CRC mismatch after TFTP![/red] "
-                        f"expected={expected_crc:08X} got={ram_crc:08X}"
-                    )
-                    raise typer.Exit(1)
                 if output == "human":
                     console.print(f"    TFTP CRC verified: {ram_crc:08X}")
 
@@ -1011,13 +1149,17 @@ async def run_install(request: InstallRequest) -> None:
                     )
 
                 await replace_in_tftp(tftp_alias["rootfs"], ubifs_data)
-                try:
-                    await _tftp_to_ram(tftp_alias["rootfs"], timeout=120.0)
-                except RuntimeError as exc:
-                    console.print(f"[red]TFTP failed for rootfs:[/red] {exc}")
-                    raise typer.Exit(1)
+                ubifs_crc = zlib.crc32(ubifs_data) & 0xFFFFFFFF
+                verified_ubifs_crc = await _verify_tftp_ram(
+                    "rootfs (UBI)",
+                    tftp_alias["rootfs"],
+                    ubifs_data,
+                    ubifs_crc,
+                )
                 if output == "human":
-                    console.print("    TFTP OK")
+                    console.print(
+                        f"    TFTP CRC verified: {verified_ubifs_crc:08X}"
+                    )
 
                 await _cmd(f"nand erase 0x{r_off:x} 0x{r_sz:x}", timeout=120.0)
                 nand_name = "hinand"
@@ -1156,7 +1298,7 @@ async def run_install(request: InstallRequest) -> None:
                         f"expected={expected_env_crc:08X} got={env_crc:08X}"
                     )
 
-                await _cmd("reset", timeout=1.0)
+                await _reset_command(timeout=1.0)
                 await _wait_for_openipc_shell_after_reset()
                 if output == "human":
                     console.print("  [green]OpenIPC U-Boot defaults loaded[/green]")
@@ -1272,7 +1414,7 @@ async def run_install(request: InstallRequest) -> None:
             if "reset" in stage_set:
                 if output == "human":
                     console.print("\n  [bold]Resetting device...[/bold]")
-                await _cmd("reset", timeout=3.0)
+                await _reset_command(timeout=3.0)
             elif output == "human" and "env" in stage_set:
                 console.print(
                     "\n  [yellow]Final reset skipped; device left at U-Boot prompt.[/yellow]"

@@ -40,7 +40,15 @@ class ShellTransport(Transport):
         self.closed = True
 
 
-async def _run_env_only_install(monkeypatch, tmp_path, unlock_response: str):
+async def _run_env_only_install(
+    monkeypatch,
+    tmp_path,
+    unlock_response: str,
+    *,
+    probe_response: str = 'Spi(cs1): Block:64KB Chip:8MB Name:"XT25F64B"\nOpenIPC # ',
+    download_mode: bool = False,
+    download_unlock_ok: bool = True,
+):
     import defib.flashdump
     import defib.recovery.session
     import defib.transport.serial_platform
@@ -59,7 +67,12 @@ async def _run_env_only_install(monkeypatch, tmp_path, unlock_response: str):
     uboot = tmp_path / "u-boot.bin"
     uboot.write_bytes(b"U" * 1024)
 
-    transport = ShellTransport()
+    class DownloadModeTransport(ShellTransport):
+        async def write(self, data: bytes) -> None:
+            if b"\x03" in data:
+                self.rx.extend(b"start download process.\n")
+
+    transport = DownloadModeTransport() if download_mode else ShellTransport()
     commands: list[str] = []
 
     class FakeRecoverySession:
@@ -80,7 +93,7 @@ async def _run_env_only_install(monkeypatch, tmp_path, unlock_response: str):
         assert transport_obj is transport
         commands.append(command)
         if command == "sf probe 0":
-            return 'Spi(cs1): Block:64KB Chip:8MB Name:"XT25F64B"\nOpenIPC # '
+            return probe_response
         if command == "sf lock 0":
             return unlock_response
         if command == "printenv ethaddr":
@@ -90,6 +103,32 @@ async def _run_env_only_install(monkeypatch, tmp_path, unlock_response: str):
         return "OpenIPC # "
 
     monkeypatch.setattr(defib.flashdump, "send_command", fake_send_command)
+
+    import defib.protocol.download_cmd
+
+    class FakeDownloadCommandClient:
+        def __init__(self, transport_obj) -> None:
+            assert transport_obj is transport
+
+        async def send_command(
+            self, command: str, timeout: float = 0.0
+        ) -> tuple[bool, str]:
+            commands.append(command)
+            if command == "sf probe 0":
+                return True, probe_response
+            if command == "sf lock 0":
+                return download_unlock_ok, unlock_response
+            if command == "printenv ethaddr":
+                return True, "ethaddr=00:12:41:8e:c6:0e\n"
+            if command == "saveenv":
+                return True, "Saving Environment to SPI Flash... done\n"
+            return True, ""
+
+    monkeypatch.setattr(
+        defib.protocol.download_cmd,
+        "DownloadCommandClient",
+        FakeDownloadCommandClient,
+    )
     monkeypatch.setattr(
         defib.recovery.session,
         "RecoverySession",
@@ -162,4 +201,87 @@ async def test_nor_unlock_failure_stops_before_persistent_write(monkeypatch, tmp
     assert exc_info.value.exit_code == 1
     assert "sf lock 0" in commands
     assert "saveenv" not in commands
+    assert transport.closed is True
+
+
+@pytest.mark.asyncio
+async def test_nor_probe_failure_stops_before_unlock_with_size_override(
+    monkeypatch, tmp_path
+):
+    run_install, request, commands, transport = await _run_env_only_install(
+        monkeypatch,
+        tmp_path,
+        "OpenIPC # ",
+        probe_response="No SPI flash selected. Please run `sf probe'\nOpenIPC # ",
+    )
+
+    with pytest.raises(typer.Exit) as exc_info:
+        await run_install(request)
+
+    assert exc_info.value.exit_code == 1
+    assert commands == ["sf probe 0"]
+    assert transport.closed is True
+
+
+@pytest.mark.asyncio
+async def test_download_command_failure_stops_before_persistent_write(
+    monkeypatch, tmp_path
+):
+    run_install, request, commands, transport = await _run_env_only_install(
+        monkeypatch,
+        tmp_path,
+        "",
+        download_mode=True,
+        download_unlock_ok=False,
+    )
+
+    with pytest.raises(typer.Exit) as exc_info:
+        await run_install(request)
+
+    assert exc_info.value.exit_code == 1
+    assert "sf probe 0" in commands
+    assert "sf lock 0" in commands
+    assert "saveenv" not in commands
+    assert transport.closed is True
+
+
+
+@pytest.mark.asyncio
+async def test_final_reset_does_not_require_prompt(monkeypatch, tmp_path):
+    from dataclasses import replace
+
+    import defib.flashdump
+
+    run_install, request, commands, transport = await _run_env_only_install(
+        monkeypatch,
+        tmp_path,
+        "OpenIPC # ",
+    )
+
+    async def prompt_sensitive_send_command(
+        transport_obj,
+        command: str,
+        timeout: float = 0.0,
+        wait_for: str | None = None,
+        **kwargs,
+    ) -> str:
+        assert transport_obj is transport
+        commands.append(command)
+        if command == "sf probe 0":
+            return 'Spi(cs1): Block:64KB Chip:8MB Name:"XT25F64B"\nOpenIPC # '
+        if command == "reset":
+            assert wait_for is None
+            return "resetting...\n"
+        return "OpenIPC # "
+
+    monkeypatch.setattr(
+        defib.flashdump,
+        "send_command",
+        prompt_sensitive_send_command,
+    )
+    reset_request = replace(request, stages=("reset",))
+
+    await run_install(reset_request)
+
+    assert commands == ["sf probe 0", "reset"]
     assert transport.closed is True

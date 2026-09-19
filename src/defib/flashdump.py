@@ -269,6 +269,7 @@ async def send_command(
     timeout: float = 5.0,
     wait_for: str | None = None,
     verify_echo: bool = False,
+    require_prompt: bool = False,
 ) -> str:
     """Send a command to U-Boot and collect the response.
 
@@ -276,6 +277,11 @@ async def send_command(
     the command is entered one character at a time and U-Boot must echo every
     byte correctly before the final carriage return is sent.  This prevents a
     corrupted ``sf erase/write/read`` line from ever being executed.
+
+    Historically callers using ``wait_for`` received the partial buffer when the
+    deadline expired. Keep that behavior by default because dump/restore probes
+    use timeout as capability information. Installer writes opt into strict prompt
+    completion with ``require_prompt=True``.
     """
     # Clear any pending input.
     try:
@@ -316,7 +322,14 @@ async def send_command(
                 return buf.decode("ascii", errors="replace")
             continue
 
-    return buf.decode("ascii", errors="replace")
+    response = buf.decode("ascii", errors="replace")
+    if wait_for and require_prompt:
+        partial = response.strip()[-200:] or "<no response>"
+        raise TransportTimeout(
+            f"Timed out waiting for {wait_for!r} after U-Boot command {cmd!r}; "
+            f"partial response: {partial}"
+        )
+    return response
 
 
 async def tftp_to_ram(

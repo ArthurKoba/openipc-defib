@@ -14,6 +14,7 @@ from defib.install.layout import (
     select_nor_size_mb,
     set_uboot_env_verified,
     uboot_flash_command_error,
+    uboot_sf_lock_unsupported,
     verify_spi_environment_crc,
 )
 
@@ -99,6 +100,28 @@ def test_uboot_flash_error_detects_spi_write_failure():
 
 def test_uboot_flash_error_detects_missing_spi_probe():
     response = "No SPI flash selected. Please run `sf probe'\nOpenIPC # "
+    assert uboot_flash_command_error(response) is not None
+
+
+def test_uboot_flash_error_detects_failed_to_initialize_probe():
+    response = "Failed to initialize SPI flash at 0:0 (error -2)\nOpenIPC # "
+    assert uboot_flash_command_error(response) is not None
+
+
+def test_sf_lock_usage_without_lock_entry_is_unsupported():
+    response = (
+        "Usage:\n"
+        "sf probe [[bus:]cs] [hz] [mode]\n"
+        "sf read addr offset len\n"
+        "sf write addr offset len\n"
+        "OpenIPC # "
+    )
+    assert uboot_sf_lock_unsupported(response) is True
+
+
+def test_sf_lock_usage_with_lock_entry_is_not_unsupported():
+    response = "Usage:\nsf lock [offset] [len]\nOpenIPC # "
+    assert uboot_sf_lock_unsupported(response) is False
     assert uboot_flash_command_error(response) is not None
 
 

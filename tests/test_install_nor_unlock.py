@@ -48,6 +48,9 @@ async def _run_env_only_install(
     probe_response: str = 'Spi(cs1): Block:64KB Chip:8MB Name:"XT25F64B"\nOpenIPC # ',
     download_mode: bool = False,
     download_unlock_ok: bool = True,
+    download_ethaddr_ok: bool = True,
+    download_ethaddr_response: str = "ethaddr=00:12:41:8e:c6:0e\n",
+    shell_unlock_timeout: bool = False,
 ):
     import defib.flashdump
     import defib.recovery.session
@@ -95,6 +98,8 @@ async def _run_env_only_install(
         if command == "sf probe 0":
             return probe_response
         if command == "sf lock 0":
+            if shell_unlock_timeout:
+                raise TransportTimeout("synthetic sf lock prompt timeout")
             return unlock_response
         if command == "printenv ethaddr":
             return "ethaddr=00:12:41:8e:c6:0e\nOpenIPC # "
@@ -119,7 +124,7 @@ async def _run_env_only_install(
             if command == "sf lock 0":
                 return download_unlock_ok, unlock_response
             if command == "printenv ethaddr":
-                return True, "ethaddr=00:12:41:8e:c6:0e\n"
+                return download_ethaddr_ok, download_ethaddr_response
             if command == "saveenv":
                 return True, "Saving Environment to SPI Flash... done\n"
             return True, ""
@@ -182,7 +187,7 @@ async def test_nor_unlock_unsupported_is_compatible(monkeypatch, tmp_path):
 
     await run_install(request)
 
-    assert "sf lock 0" in commands
+    assert commands.count("sf lock 0") == 1
     assert "saveenv" in commands
     assert transport.closed is True
 
@@ -284,4 +289,98 @@ async def test_final_reset_does_not_require_prompt(monkeypatch, tmp_path):
     await run_install(reset_request)
 
     assert commands == ["sf probe 0", "reset"]
+    assert transport.closed is True
+
+
+@pytest.mark.asyncio
+async def test_nor_probe_failed_to_initialize_stops_before_unlock(monkeypatch, tmp_path):
+    run_install, request, commands, transport = await _run_env_only_install(
+        monkeypatch,
+        tmp_path,
+        "OpenIPC # ",
+        probe_response="Failed to initialize SPI flash at 0:0 (error -2)\nOpenIPC # ",
+    )
+
+    with pytest.raises(typer.Exit) as exc_info:
+        await run_install(request)
+
+    assert exc_info.value.exit_code == 1
+    assert commands == ["sf probe 0"]
+    assert transport.closed is True
+
+
+@pytest.mark.asyncio
+async def test_shell_unlock_prompt_timeout_stops_before_persistent_write(
+    monkeypatch, tmp_path
+):
+    run_install, request, commands, transport = await _run_env_only_install(
+        monkeypatch,
+        tmp_path,
+        "",
+        shell_unlock_timeout=True,
+    )
+
+    with pytest.raises(typer.Exit) as exc_info:
+        await run_install(request)
+
+    assert exc_info.value.exit_code == 1
+    assert "sf lock 0" in commands
+    assert "saveenv" not in commands
+    assert transport.closed is True
+
+
+@pytest.mark.asyncio
+async def test_sf_lock_usage_for_supported_subcommand_is_not_treated_as_unsupported(
+    monkeypatch, tmp_path
+):
+    run_install, request, commands, transport = await _run_env_only_install(
+        monkeypatch,
+        tmp_path,
+        "Usage:\nsf lock [offset] [len]\nOpenIPC # ",
+    )
+
+    with pytest.raises(typer.Exit) as exc_info:
+        await run_install(request)
+
+    assert exc_info.value.exit_code == 1
+    assert "sf lock 0" in commands
+    assert "saveenv" not in commands
+    assert transport.closed is True
+
+
+@pytest.mark.asyncio
+async def test_download_missing_optional_ethaddr_still_generates_rescue_mac(
+    monkeypatch, tmp_path
+):
+    run_install, request, commands, transport = await _run_env_only_install(
+        monkeypatch,
+        tmp_path,
+        "OpenIPC # ",
+        download_mode=True,
+        download_ethaddr_ok=False,
+        download_ethaddr_response='## Error: "ethaddr" not defined\n',
+    )
+
+    await run_install(request)
+
+    assert any(command.startswith("setenv ethaddr ") for command in commands)
+    assert "saveenv" in commands
+    assert transport.closed is True
+
+
+
+@pytest.mark.asyncio
+async def test_download_unsupported_sf_lock_remains_compatible(monkeypatch, tmp_path):
+    run_install, request, commands, transport = await _run_env_only_install(
+        monkeypatch,
+        tmp_path,
+        "Usage:\nsf probe [[bus:]cs] [hz] [mode]\nsf read addr offset len\n",
+        download_mode=True,
+        download_unlock_ok=False,
+    )
+
+    await run_install(request)
+
+    assert "sf lock 0" in commands
+    assert "saveenv" in commands
     assert transport.closed is True

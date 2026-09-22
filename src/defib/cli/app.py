@@ -2184,8 +2184,9 @@ def install(
         "--wipe-rootfs-data",
         help=(
             "Erase and CRC-verify the persistent rootfs_data overlay on NOR. "
-            "Generic installs preserve it unless this flag is given; registered "
-            "stock-U-Boot migrations keep their existing migration behavior."
+            "Generic installs preserve it unless this flag is given; with exact "
+            "--stage selection include --stage rootfs-data. Registered stock-U-Boot "
+            "migrations keep their existing migration behavior."
         ),
     ),
     final_reset: bool = typer.Option(

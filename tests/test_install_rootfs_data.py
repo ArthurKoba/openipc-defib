@@ -143,7 +143,7 @@ async def test_generic_rootfs_data_stage_keeps_existing_noop_behavior(
 
 
 @pytest.mark.asyncio
-async def test_wipe_rootfs_data_flag_erases_and_verifies_without_stage_dependency(
+async def test_wipe_rootfs_data_flag_erases_and_verifies_in_exact_stage_plan(
     monkeypatch, tmp_path
 ):
     run_install, request, commands, transport = await _prepare_generic_install(
@@ -152,7 +152,7 @@ async def test_wipe_rootfs_data_flag_erases_and_verifies_without_stage_dependenc
 
     await run_install(
         request(
-            stages=("reset",),
+            stages=("rootfs-data", "reset"),
             wipe_rootfs_data=True,
         )
     )
@@ -177,7 +177,7 @@ async def test_wipe_rootfs_data_rejects_nand_before_transport(monkeypatch, tmp_p
     with pytest.raises(typer.Exit) as exc_info:
         await run_install(
             request(
-                stages=("reset",),
+                stages=("rootfs-data", "reset"),
                 wipe_rootfs_data=True,
                 nand=True,
             )
@@ -203,3 +203,76 @@ async def test_wipe_rootfs_data_conflicts_with_skip_stage(monkeypatch, tmp_path)
 
     assert exc_info.value.exit_code == 2
     assert commands == []
+
+
+@pytest.mark.asyncio
+async def test_wipe_rootfs_data_conflicts_with_exact_stage_omitting_rootfs_data(
+    monkeypatch, tmp_path
+):
+    run_install, request, commands, _transport = await _prepare_generic_install(
+        monkeypatch, tmp_path
+    )
+
+    with pytest.raises(typer.Exit) as exc_info:
+        await run_install(
+            request(
+                stages=("uboot",),
+                wipe_rootfs_data=True,
+            )
+        )
+
+    assert exc_info.value.exit_code == 2
+    assert commands == []
+
+
+@pytest.mark.asyncio
+async def test_chainloaded_stock_uboot_wipe_requires_uboot_stage(monkeypatch, tmp_path):
+    import defib.vendors.registry
+    from defib.vendors.base import UBootBootstrapResult
+    from defib.vendors.registry import StockUBootTarget
+
+    run_install, request, commands, transport = await _prepare_generic_install(
+        monkeypatch, tmp_path
+    )
+
+    target = StockUBootTarget(
+        selector="hi3516ev200:test-stock",
+        handler="synthetic",
+        load_address=0x82000000,
+        display_name="Synthetic stock board",
+        vendor="Test",
+        stock_uboot_name="Synthetic U-Boot",
+    )
+
+    class ChainloadedBootstrap:
+        requires_echo_verification = False
+
+        async def bootstrap(self, transport_obj, firmware, *, filename):
+            assert transport_obj is transport
+            return UBootBootstrapResult(
+                recovery=RecoveryResult(success=True),
+                chainloaded=True,
+            )
+
+    monkeypatch.setattr(
+        defib.vendors.registry,
+        "get_stock_uboot_target",
+        lambda selector: target,
+    )
+    monkeypatch.setattr(
+        defib.vendors.registry,
+        "create_uboot_bootstrap",
+        lambda *args, **kwargs: ChainloadedBootstrap(),
+    )
+
+    with pytest.raises(typer.Exit) as exc_info:
+        await run_install(
+            request(
+                stages=("rootfs-data",),
+                wipe_rootfs_data=True,
+            )
+        )
+
+    assert exc_info.value.exit_code == 2
+    assert not any(command.startswith("sf erase ") for command in commands)
+    assert transport.closed is True

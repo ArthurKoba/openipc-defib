@@ -99,7 +99,9 @@ without wiping the environment.
 Generic NOR installs preserve the existing `rootfs_data` overlay by default.
 Add `--wipe-rootfs-data` when a clean persistent overlay is desired; Defib
 erases the region and verifies the erased contents by CRC before continuing.
-Registered stock-U-Boot migrations retain their existing `rootfs_data`
+When an exact `--stage` plan is used, that plan must include
+`--stage rootfs-data`; `--skip-stage rootfs-data` conflicts with an explicit
+wipe. Registered stock-U-Boot migrations retain their existing `rootfs_data`
 cleanup behavior.
 
 The release U-Boot owns boot-critical hardware initialization such as DDR

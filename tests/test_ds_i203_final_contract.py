@@ -651,7 +651,15 @@ async def test_stock_env_verify_failure_before_tftp_closes_uart(monkeypatch, tmp
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "crc_failure",
-    [None, "tftp", "tftp-once", "readback", "env"],
+    [
+        None,
+        "tftp",
+        "tftp-once",
+        "tftp-timeout-once",
+        "tftp-unparseable-once",
+        "readback",
+        "env",
+    ],
 )
 async def test_ds_i203_stock_install_persists_detected_layout_but_not_camera_policy(
     monkeypatch, tmp_path, crc_failure, capsys
@@ -859,6 +867,10 @@ async def test_ds_i203_stock_install_persists_detected_layout_but_not_camera_pol
                 return "==> 00000000\nOpenIPC # "
             if crc_failure == "tftp-once" and crc_calls == 1:
                 return "==> 00000000\nOpenIPC # "
+            if crc_failure == "tftp-timeout-once" and crc_calls == 1:
+                raise TransportTimeout("synthetic CRC prompt timeout")
+            if crc_failure == "tftp-unparseable-once" and crc_calls == 1:
+                return "CRC32 output truncated\nOpenIPC # "
             if crc_failure == "readback" and crc_calls == 2:
                 return "CRC32 output truncated\nOpenIPC # "
             parts = command.split()
@@ -937,7 +949,13 @@ async def test_ds_i203_stock_install_persists_detected_layout_but_not_camera_pol
         output="json",
     )
 
-    if crc_failure in (None, "tftp-once"):
+    retry_success_cases = {
+        None,
+        "tftp-once",
+        "tftp-timeout-once",
+        "tftp-unparseable-once",
+    }
+    if crc_failure in retry_success_cases:
         await orchestrator.run_install(request)
     else:
         with pytest.raises(typer.Exit) as exc_info:
@@ -955,10 +973,12 @@ async def test_ds_i203_stock_install_persists_detected_layout_but_not_camera_pol
             assert any(cmd.startswith("cmp.l 0x82000000 ") for cmd in commands)
         return
 
-    if crc_failure == "tftp-once":
+    if crc_failure in {"tftp-once", "tftp-timeout-once", "tftp-unparseable-once"}:
+        from defib.network.tftp_server import MAX_BLOCKSIZE
+
         assert commands.count("tftpboot u") == 2
         assert tftp_protocol_obj is not None
-        assert tftp_protocol_obj.blocksize_caps == [512]
+        assert tftp_protocol_obj.blocksize_caps == [512, MAX_BLOCKSIZE]
 
         warning_lines = [
             line
@@ -970,7 +990,12 @@ async def test_ds_i203_stock_install_persists_detected_layout_but_not_camera_pol
         assert warning["message"].startswith(
             "Attempt 2: fetching TFTP file 'u' again for U-Boot "
         )
-        assert "CRC expected=" in warning["message"]
+        if crc_failure == "tftp-once":
+            assert "CRC expected=" in warning["message"]
+        elif crc_failure == "tftp-timeout-once":
+            assert "CRC command failed or timed out:" in warning["message"]
+        else:
+            assert "CRC response did not contain a complete checksum:" in warning["message"]
         assert "using 512-byte blocks." in warning["message"]
 
         uboot_tftp = [
@@ -997,6 +1022,18 @@ async def test_ds_i203_stock_install_persists_detected_layout_but_not_camera_pol
             < uboot_crc[1]
             < first_erase
         )
+
+    first_internal_reset = commands.index("reset")
+    probe_indices = [i for i, command in enumerate(commands) if command == "sf probe 0"]
+    unlock_indices = [i for i, command in enumerate(commands) if command == "sf lock 0"]
+    assert len(probe_indices) >= 2
+    assert len(unlock_indices) >= 2
+    assert (
+        first_internal_reset
+        < probe_indices[1]
+        < unlock_indices[1]
+        < commands.index("saveenv")
+    )
 
     expected_mtdparts = nor_mtdparts(16)
 
